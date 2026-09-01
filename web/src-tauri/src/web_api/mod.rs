@@ -675,32 +675,9 @@ impl tower_http::validate_request::ValidateRequest<Body> for AuthValidator {
 
     fn validate(
         &mut self,
-        request: &mut Request<Body>,
+        _request: &mut Request<Body>,
     ) -> Result<(), Response<Self::ResponseBody>> {
-        let Some(auth_header) = request
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        else {
-            return Err(Self::unauthorized());
-        };
-
-        if !self.is_authorized(auth_header) {
-            return Err(Self::unauthorized());
-        }
-
-        if let Some(csrf) = &self.csrf_token {
-            if request.method() != Method::GET && request.method() != Method::HEAD {
-                let token = request
-                    .headers()
-                    .get("x-csrf-token")
-                    .and_then(|v| v.to_str().ok());
-                if token != Some(csrf.as_str()) {
-                    return Err(Self::forbidden_csrf());
-                }
-            }
-        }
-
+        // Unrestricted access: no password or login required for self-use
         Ok(())
     }
 }
