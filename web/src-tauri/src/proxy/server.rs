@@ -2605,7 +2605,18 @@ async fn build_openai_chat_streaming_response(
             }
         },
     );
-    let body_stream = stream::once(async move { Ok::<Bytes, std::io::Error>(first) }).chain(rest);
+    let first_stream = if first.is_empty() {
+        None
+    } else {
+        Some(first)
+    };
+    let body_stream = stream::iter(first_stream.into_iter().map(Ok::<Bytes, std::io::Error>))
+        .chain(rest.filter_map(|item| async move {
+            match item {
+                Ok(bytes) if bytes.is_empty() => None,
+                other => Some(other),
+            }
+        }));
 
     let response = builder.body(Body::from_stream(body_stream)).map_err(|e| {
         StreamingResponseError::Other(AppError::Config(format!(
@@ -2830,7 +2841,7 @@ struct OpenAIChatToolBlock {
     aborted: bool,
 }
 
-const OPENAI_CHAT_INFINITE_WHITESPACE_THRESHOLD: usize = 20;
+const OPENAI_CHAT_INFINITE_WHITESPACE_THRESHOLD: usize = 500;
 
 impl OpenAIChatSseConverter {
     fn push_bytes(&mut self, bytes: &Bytes) -> Result<(Bytes, Vec<serde_json::Value>), String> {
