@@ -3199,24 +3199,29 @@ impl OpenAIChatSseConverter {
             return Vec::new();
         }
         self.completed = true;
-        let mut output = Vec::new();
-        if let Some((stop_reason, usage)) = self.pending_message_delta.take() {
-            let usage = usage.unwrap_or_else(|| {
-                serde_json::json!({
-                    "input_tokens": 0,
-                    "output_tokens": 0
-                })
-            });
-            let event = serde_json::json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": stop_reason,
-                    "stop_sequence": serde_json::Value::Null
-                },
-                "usage": usage
-            });
-            output.extend(encode_sse_event("message_delta", &event));
-        }
+        let mut output = self.close_current_non_tool_block();
+        output.extend(self.late_start_pending_tools());
+        output.extend(self.close_open_tools());
+
+        let (stop_reason, usage) = self.pending_message_delta.take().unwrap_or_else(|| {
+            (Some("end_turn".to_string()), self.latest_usage.clone())
+        });
+        let usage = usage.unwrap_or_else(|| {
+            serde_json::json!({
+                "input_tokens": 0,
+                "output_tokens": 0
+            })
+        });
+        let event = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": stop_reason,
+                "stop_sequence": serde_json::Value::Null
+            },
+            "usage": usage
+        });
+        output.extend(encode_sse_event("message_delta", &event));
+
         if self.started {
             let event = serde_json::json!({ "type": "message_stop" });
             output.extend(encode_sse_event("message_stop", &event));
@@ -3231,10 +3236,7 @@ impl OpenAIChatSseConverter {
     }
 
     fn finish(&mut self) -> Bytes {
-        if self.completed {
-            return Bytes::new();
-        }
-        if self.pending_message_delta.is_none() {
+        if self.completed || !self.started {
             return Bytes::new();
         }
         Bytes::from(self.finish_done())

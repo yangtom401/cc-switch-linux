@@ -1638,6 +1638,7 @@ fn openai_chat_messages_from_content_blocks(
     let mut result = Vec::new();
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
+    let mut reasoning_parts = Vec::new();
 
     for block in blocks {
         match block
@@ -1694,6 +1695,16 @@ fn openai_chat_messages_from_content_blocks(
                     "content": content
                 }));
             }
+            "thinking" => {
+                if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                    if !thinking.is_empty() {
+                        reasoning_parts.push(thinking.to_string());
+                    }
+                }
+            }
+            "redacted_thinking" => {
+                reasoning_parts.push("[redacted thinking]".to_string());
+            }
             _ => {}
         }
     }
@@ -1715,6 +1726,16 @@ fn openai_chat_messages_from_content_blocks(
         if !tool_calls.is_empty() {
             msg["tool_calls"] = json!(tool_calls);
         }
+
+        if role == "assistant" && !tool_calls.is_empty() {
+            let reasoning_content = if reasoning_parts.is_empty() {
+                "tool call".to_string()
+            } else {
+                reasoning_parts.join("\n")
+            };
+            msg["reasoning_content"] = json!(reasoning_content);
+        }
+
         result.push(msg);
     }
 
