@@ -1080,6 +1080,49 @@ pub fn resolve_proxy_request_route(
         }
     }
 
+    let req_lower = requested.to_lowercase();
+    let mapped_env_model = provider
+        .settings_config
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| {
+            if req_lower.contains("fable") {
+                env.get("ANTHROPIC_DEFAULT_FABLE_MODEL")
+                    .or_else(|| env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"))
+            } else if req_lower.contains("haiku") {
+                env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+            } else if req_lower.contains("opus") {
+                env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+            } else if req_lower.contains("sonnet") {
+                env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+            } else {
+                None
+            }
+            .or_else(|| env.get("CLAUDE_CODE_SUBAGENT_MODEL"))
+            .or_else(|| env.get("ANTHROPIC_MODEL"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+
+    if let Some(upstream) = mapped_env_model {
+        let stripped = strip_one_m_suffix(upstream);
+        return Ok(ResolvedModelRoute {
+            route_id: requested.to_string(),
+            upstream_model: stripped.to_string(),
+            label_override: None,
+            supports_1m: upstream.to_lowercase().ends_with("[1m]"),
+        });
+    }
+
     Ok(ResolvedModelRoute {
         route_id: requested.to_string(),
         upstream_model: requested.to_string(),
