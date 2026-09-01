@@ -1485,20 +1485,37 @@ fn rename_field(obj: &mut serde_json::Map<String, Value>, from: &str, to: &str) 
     }
 }
 
+pub fn strip_one_m_suffix(model: &str) -> &str {
+    let trimmed = model.trim_end();
+    let marker = ONE_M_CONTEXT_MARKER.as_bytes();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= marker.len()
+        && bytes[bytes.len() - marker.len()..].eq_ignore_ascii_case(marker)
+    {
+        return trimmed[..trimmed.len() - marker.len()].trim_end();
+    }
+    model
+}
+
 fn apply_openai_chat_model_parameters(obj: &mut Map<String, Value>) {
-    let model = obj
+    let raw_model = obj
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let stripped = strip_one_m_suffix(&raw_model);
+    if stripped != raw_model {
+        obj.insert("model".to_string(), json!(stripped));
+    }
+    let model = stripped;
     if let Some(max_tokens) = obj.remove("max_tokens") {
-        if is_openai_o_series(&model) {
+        if is_openai_o_series(model) {
             obj.insert("max_completion_tokens".to_string(), max_tokens);
         } else {
             obj.insert("max_tokens".to_string(), max_tokens);
         }
     }
-    if supports_reasoning_effort(&model) {
+    if supports_reasoning_effort(model) {
         if let Some(effort) = resolve_openai_reasoning_effort(obj) {
             obj.insert(
                 "reasoning_effort".to_string(),
@@ -1511,12 +1528,17 @@ fn apply_openai_chat_model_parameters(obj: &mut Map<String, Value>) {
 }
 
 fn apply_openai_responses_reasoning_parameters(obj: &mut Map<String, Value>) {
-    let model = obj
+    let raw_model = obj
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if supports_reasoning_effort(&model) {
+    let stripped = strip_one_m_suffix(&raw_model);
+    if stripped != raw_model {
+        obj.insert("model".to_string(), json!(stripped));
+    }
+    let model = stripped;
+    if supports_reasoning_effort(model) {
         if let Some(effort) = resolve_openai_reasoning_effort(obj) {
             obj.insert("reasoning".to_string(), json!({ "effort": effort }));
         }
