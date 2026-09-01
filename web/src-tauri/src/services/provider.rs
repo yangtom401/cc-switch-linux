@@ -1,0 +1,3992 @@
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::app_config::{AppType, MultiAppConfig};
+use crate::codex_config::{get_codex_auth_path, get_codex_config_path, write_codex_live_atomic};
+use crate::config::{
+    delete_file, get_claude_settings_path, get_provider_config_path, read_json_file,
+    write_json_file, write_text_file,
+};
+use crate::error::AppError;
+use crate::provider::{Provider, ProviderMeta, ProviderType, UsageData, UsageResult};
+use crate::settings::{self, CustomEndpoint};
+use crate::store::AppState;
+use crate::usage_script;
+
+/// 供应商相关业务逻辑
+pub struct ProviderService;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenClawReconciliationStatus {
+    New,
+    Changed,
+    Unchanged,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawReconciliationItem {
+    pub provider_id: String,
+    pub display_name: String,
+    pub status: OpenClawReconciliationStatus,
+    pub model_count: usize,
+    pub has_api_key: bool,
+    pub live_config_managed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawReconciliationPreview {
+    pub etag: String,
+    pub live_count: usize,
+    pub stored_count: usize,
+    pub items: Vec<OpenClawReconciliationItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenClawReconciliationOutcome {
+    pub imported: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub ignored: usize,
+    pub invalid: usize,
+    pub etag: String,
+}
+
+#[derive(Clone)]
+enum LiveSnapshot {
+    Noop,
+    Claude {
+        settings: Option<Value>,
+    },
+    Codex {
+        auth: Option<Value>,
+        config: Option<String>,
+    },
+    Gemini {
+        env: Option<HashMap<String, String>>, // 新增
+        config: Option<Value>,                // 新增：settings.json 内容
+    },
+    Opencode {
+        config: Option<Value>,
+    },
+    OpenClaw {
+        config: Option<String>,
+    },
+    GrokBuild {
+        config: Option<String>,
+    },
+    Hermes {
+        config: Option<Value>,
+    },
+}
+
+#[derive(Clone)]
+struct PostCommitAction {
+    app_type: AppType,
+    provider: Provider,
+    backup: LiveSnapshot,
+    sync_mcp: bool,
+    refresh_snapshot: bool,
+    set_additive_default: bool,
+}
+
+impl LiveSnapshot {
+    fn restore(&self) -> Result<(), AppError> {
+        match self {
+            LiveSnapshot::Noop => {}
+            LiveSnapshot::Claude { settings } => {
+                let path = get_claude_settings_path()?;
+                if let Some(value) = settings {
+                    write_json_file(&path, value)?;
+                } else if path.exists() {
+                    delete_file(&path)?;
+                }
+            }
+            LiveSnapshot::Codex { auth, config } => {
+                let auth_path = get_codex_auth_path()?;
+                let config_path = get_codex_config_path()?;
+                if let Some(value) = auth {
+                    write_json_file(&auth_path, value)?;
+                } else if auth_path.exists() {
+                    delete_file(&auth_path)?;
+                }
+
+                if let Some(text) = config {
+                    write_text_file(&config_path, text)?;
+                } else if config_path.exists() {
+                    delete_file(&config_path)?;
+                }
+            }
+            LiveSnapshot::Gemini { env, .. } => {
+                // 新增
+                use crate::gemini_config::{
+                    get_gemini_env_path, get_gemini_settings_path, write_gemini_env_atomic,
+                };
+                let path = get_gemini_env_path()?;
+                if let Some(env_map) = env {
+                    write_gemini_env_atomic(env_map)?;
+                } else if path.exists() {
+                    delete_file(&path)?;
+                }
+
+                let settings_path = get_gemini_settings_path()?;
+                match self {
+                    LiveSnapshot::Gemini {
+                        config: Some(cfg), ..
+                    } => {
+                        write_json_file(&settings_path, cfg)?;
+                    }
+                    LiveSnapshot::Gemini { config: None, .. } if settings_path.exists() => {
+                        delete_file(&settings_path)?;
+                    }
+                    _ => {}
+                }
+            }
+            LiveSnapshot::Opencode { config } => {
+                let path = crate::opencode_config::get_opencode_config_path();
+                if let Some(value) = config {
+                    write_json_file(&path, value)?;
+                } else if path.exists() {
+                    delete_file(&path)?;
+                }
+            }
+            LiveSnapshot::OpenClaw { config } => {
+                let path = crate::openclaw_config::get_openclaw_config_path();
+                if let Some(source) = config {
+                    crate::config::atomic_write(&path, source.as_bytes())?;
+                } else if path.exists() {
+                    delete_file(&path)?;
+                }
+            }
+            LiveSnapshot::GrokBuild { config } => {
+                let path = crate::grok_config::get_grok_config_path();
+                if let Some(source) = config {
+                    crate::config::write_text_file(&path, source)?;
+                } else if path.exists() {
+                    delete_file(&path)?;
+                }
+            }
+            LiveSnapshot::Hermes { config } => {
+                let path = crate::hermes_config::get_hermes_config_path();
+                if let Some(value) = config {
+                    let yaml = crate::hermes_config::json_to_yaml(value)?;
+                    let yaml_text = serde_yaml::to_string(&yaml)
+                        .map_err(|e| AppError::Config(format!("Failed to serialize YAML: {e}")))?;
+                    crate::config::atomic_write(&path, yaml_text.as_bytes())?;
+                } else if path.exists() {
+                    delete_file(&path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_provider_settings_rejects_missing_auth() {
+        let provider = Provider::with_id(
+            "codex".into(),
+            "Codex".into(),
+            json!({ "config": "base_url = \"https://example.com\"" }),
+            None,
+        );
+        let err = ProviderService::validate_provider_settings(&AppType::Codex, &provider)
+            .expect_err("missing auth should be rejected");
+        assert!(
+            err.to_string().contains("auth"),
+            "expected auth error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn extract_credentials_returns_expected_values() {
+        let provider = Provider::with_id(
+            "claude".into(),
+            "Claude".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "token",
+                    "ANTHROPIC_BASE_URL": "https://claude.example"
+                }
+            }),
+            None,
+        );
+        let (api_key, base_url) =
+            ProviderService::extract_credentials(&provider, &AppType::Claude).unwrap();
+        assert_eq!(api_key, "token");
+        assert_eq!(base_url, "https://claude.example");
+    }
+
+    #[test]
+    fn codex_oauth_live_write_requires_proxy_takeover() {
+        let mut provider = Provider::with_id(
+            "codex-oauth".into(),
+            "Codex OAuth".into(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "" },
+                "config": "model_provider = \"codex_oauth\""
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("codex_oauth".to_string()),
+            ..ProviderMeta::default()
+        });
+
+        let err = ProviderService::write_codex_live(&provider)
+            .expect_err("Codex OAuth should use proxy takeover");
+
+        assert!(err.to_string().contains("代理接管"));
+    }
+
+    #[test]
+    fn claude_managed_oauth_live_write_requires_proxy_takeover() {
+        let mut provider = Provider::with_id(
+            "github-copilot".into(),
+            "GitHub Copilot".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.githubcopilot.com",
+                    "ANTHROPIC_AUTH_TOKEN": ""
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".to_string()),
+            ..ProviderMeta::default()
+        });
+
+        let err = ProviderService::write_claude_live(&provider)
+            .expect_err("managed OAuth Claude provider should use proxy takeover");
+
+        assert!(err.to_string().contains("代理接管"));
+    }
+
+    #[test]
+    fn manual_api_key_oauth_provider_is_not_treated_as_managed_live_write() {
+        let mut provider = Provider::with_id(
+            "github-copilot-manual".into(),
+            "GitHub Copilot Manual".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.githubcopilot.com",
+                    "ANTHROPIC_AUTH_TOKEN": "manual-token"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".to_string()),
+            auth_binding: Some(crate::provider::ProviderAuthBinding {
+                mode: " API_KEY ".to_string(),
+                provider_type: Some("github_copilot".to_string()),
+                account_id: None,
+                use_default: None,
+            }),
+            ..ProviderMeta::default()
+        });
+
+        assert!(!ProviderService::is_managed_oauth_provider(&provider));
+    }
+
+    #[test]
+    fn legacy_oauth_provider_with_manual_token_is_not_treated_as_managed_live_write() {
+        let mut provider = Provider::with_id(
+            "github-copilot-legacy-manual".into(),
+            "GitHub Copilot Legacy Manual".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.githubcopilot.com",
+                    "ANTHROPIC_AUTH_TOKEN": "manual-token"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("github_copilot".to_string()),
+            ..ProviderMeta::default()
+        });
+
+        assert!(!ProviderService::is_managed_oauth_provider(&provider));
+    }
+
+    #[test]
+    fn replace_api_key_replaces_anthropic_token_in_claude_config() {
+        let mut settings = json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "old-token",
+                "ANTHROPIC_BASE_URL": "https://example.com"
+            }
+        });
+        let replaced = ProviderService::replace_api_key_in_settings(&mut settings, "new-token");
+        assert!(replaced);
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "new-token");
+        assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], "https://example.com");
+    }
+
+    #[test]
+    fn replace_api_key_replaces_codex_openai_key() {
+        let mut settings = json!({
+            "auth": { "OPENAI_API_KEY": "old" },
+            "config": "model_provider = \"openai\""
+        });
+        let replaced = ProviderService::replace_api_key_in_settings(&mut settings, "new");
+        assert!(replaced);
+        assert_eq!(settings["auth"]["OPENAI_API_KEY"], "new");
+    }
+
+    #[test]
+    fn replace_api_key_replaces_gemini_key() {
+        let mut settings = json!({
+            "env": { "GEMINI_API_KEY": "old", "GEMINI_MODEL": "gemini-3" }
+        });
+        let replaced = ProviderService::replace_api_key_in_settings(&mut settings, "new");
+        assert!(replaced);
+        assert_eq!(settings["env"]["GEMINI_API_KEY"], "new");
+    }
+
+    #[test]
+    fn replace_api_key_returns_false_when_no_key_field() {
+        let mut settings = json!({ "env": { "ANTHROPIC_BASE_URL": "https://x" } });
+        let replaced = ProviderService::replace_api_key_in_settings(&mut settings, "new");
+        assert!(!replaced);
+    }
+
+    #[test]
+    fn rotate_api_key_round_robins_through_keys_and_persists_index() {
+        use crate::app_config::MultiAppConfig;
+
+        let mut config = MultiAppConfig::default();
+        let mut provider = Provider::with_id(
+            "claude-1".into(),
+            "Claude 1".into(),
+            json!({
+                "env": { "ANTHROPIC_AUTH_TOKEN": "key-a", "ANTHROPIC_BASE_URL": "https://x" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_keys: vec!["key-a".to_string(), "key-b".to_string(), "key-c".to_string()],
+            api_key_index: Some(1),
+            ..ProviderMeta::default()
+        });
+        config.ensure_app(&AppType::Claude);
+        if let Some(manager) = config.get_manager_mut(&AppType::Claude) {
+            manager.providers.insert(provider.id.clone(), provider.clone());
+        }
+
+        // 从 index=1 轮询到 index=2（key-c），并持久化
+        let rotated = ProviderService::rotate_api_key_for_switch(
+            &mut config,
+            &AppType::Claude,
+            "claude-1",
+            &mut provider,
+        );
+        assert!(rotated);
+        assert_eq!(provider.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"], "key-c");
+        assert_eq!(
+            provider.meta.as_ref().unwrap().api_key_index,
+            Some(2)
+        );
+
+        // 配置存储中的 provider 已同步更新
+        let stored = config
+            .get_manager(&AppType::Claude)
+            .and_then(|m| m.providers.get("claude-1"))
+            .unwrap();
+        assert_eq!(stored.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"], "key-c");
+        assert_eq!(stored.meta.as_ref().unwrap().api_key_index, Some(2));
+    }
+
+    #[test]
+    fn rotate_api_key_noop_when_single_key() {
+        use crate::app_config::MultiAppConfig;
+
+        let mut config = MultiAppConfig::default();
+        let mut provider = Provider::with_id(
+            "claude-1".into(),
+            "Claude 1".into(),
+            json!({
+                "env": { "ANTHROPIC_AUTH_TOKEN": "only-key" }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_keys: vec!["only-key".to_string()],
+            api_key_index: None,
+            ..ProviderMeta::default()
+        });
+
+        let rotated = ProviderService::rotate_api_key_for_switch(
+            &mut config,
+            &AppType::Claude,
+            "claude-1",
+            &mut provider,
+        );
+        assert!(!rotated);
+        assert_eq!(provider.settings_config["env"]["ANTHROPIC_AUTH_TOKEN"], "only-key");
+    }
+}
+
+/// Gemini 认证类型枚举
+///
+/// 用于优化性能，避免重复检测供应商类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeminiAuthType {
+    /// PackyCode 供应商（使用 API Key）
+    Packycode,
+    /// Google 官方（使用 OAuth）
+    GoogleOfficial,
+    /// 通用 Gemini 供应商（使用 API Key）
+    Generic,
+}
+
+impl ProviderService {
+    // 认证类型常量
+    const PACKYCODE_SECURITY_SELECTED_TYPE: &'static str = "gemini-api-key";
+    const GOOGLE_OAUTH_SECURITY_SELECTED_TYPE: &'static str = "oauth-personal";
+
+    // Partner Promotion Key 常量
+    const PACKYCODE_PARTNER_KEY: &'static str = "packycode";
+    const GOOGLE_OFFICIAL_PARTNER_KEY: &'static str = "google-official";
+
+    // PackyCode 关键词常量
+    const PACKYCODE_KEYWORDS: [&'static str; 3] = ["packycode", "packyapi", "packy"];
+
+    /// 检测 Gemini 供应商的认证类型
+    ///
+    /// 一次性检测，避免在多个地方重复调用 `is_packycode_gemini` 和 `is_google_official_gemini`
+    ///
+    /// # 返回值
+    ///
+    /// - `GeminiAuthType::GoogleOfficial`: Google 官方，使用 OAuth
+    /// - `GeminiAuthType::Packycode`: PackyCode 供应商，使用 API Key
+    /// - `GeminiAuthType::Generic`: 其他通用供应商，使用 API Key
+    fn detect_gemini_auth_type(provider: &Provider) -> GeminiAuthType {
+        // 优先检查 partner_promotion_key（最可靠）
+        if let Some(key) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.partner_promotion_key.as_deref())
+        {
+            if key.eq_ignore_ascii_case(Self::GOOGLE_OFFICIAL_PARTNER_KEY) {
+                return GeminiAuthType::GoogleOfficial;
+            }
+            if key.eq_ignore_ascii_case(Self::PACKYCODE_PARTNER_KEY) {
+                return GeminiAuthType::Packycode;
+            }
+        }
+
+        // 检查 Google 官方（名称匹配）
+        let name_lower = provider.name.to_ascii_lowercase();
+        if name_lower == "google" || name_lower.starts_with("google ") {
+            return GeminiAuthType::GoogleOfficial;
+        }
+
+        // 检查 PackyCode 关键词
+        if Self::contains_packycode_keyword(&provider.name) {
+            return GeminiAuthType::Packycode;
+        }
+
+        if let Some(site) = provider.website_url.as_deref() {
+            if Self::contains_packycode_keyword(site) {
+                return GeminiAuthType::Packycode;
+            }
+        }
+
+        if let Some(base_url) = provider
+            .settings_config
+            .pointer("/env/GOOGLE_GEMINI_BASE_URL")
+            .and_then(|v| v.as_str())
+        {
+            if Self::contains_packycode_keyword(base_url) {
+                return GeminiAuthType::Packycode;
+            }
+        }
+
+        GeminiAuthType::Generic
+    }
+
+    /// 检查字符串是否包含 PackyCode 相关关键词（不区分大小写）
+    ///
+    /// 关键词列表：["packycode", "packyapi", "packy"]
+    fn contains_packycode_keyword(value: &str) -> bool {
+        let lower = value.to_ascii_lowercase();
+        Self::PACKYCODE_KEYWORDS
+            .iter()
+            .any(|keyword| lower.contains(keyword))
+    }
+
+    /// 检测供应商是否为 PackyCode Gemini（使用 API Key 认证）
+    ///
+    /// PackyCode 是官方合作伙伴，需要特殊的安全配置。
+    ///
+    /// # 检测规则（优先级从高到低）
+    ///
+    /// 1. **Partner Promotion Key**（最可靠）:
+    ///    - `provider.meta.partner_promotion_key == "packycode"`
+    ///
+    /// 2. **供应商名称**:
+    ///    - 名称包含 "packycode"、"packyapi" 或 "packy"（不区分大小写）
+    ///
+    /// 3. **网站 URL**:
+    ///    - `provider.website_url` 包含关键词
+    ///
+    /// 4. **Base URL**:
+    ///    - `settings_config.env.GOOGLE_GEMINI_BASE_URL` 包含关键词
+    ///
+    /// # 为什么需要多重检测
+    ///
+    /// - 用户可能手动创建供应商，没有 `partner_promotion_key`
+    /// - 从预设复制后可能修改了 meta 字段
+    /// - 确保所有 PackyCode 供应商都能正确设置安全标志
+    fn is_packycode_gemini(provider: &Provider) -> bool {
+        // 策略 1: 检查 partner_promotion_key（最可靠）
+        if provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.partner_promotion_key.as_deref())
+            .is_some_and(|key| key.eq_ignore_ascii_case(Self::PACKYCODE_PARTNER_KEY))
+        {
+            return true;
+        }
+
+        // 策略 2: 检查供应商名称
+        if Self::contains_packycode_keyword(&provider.name) {
+            return true;
+        }
+
+        // 策略 3: 检查网站 URL
+        if let Some(site) = provider.website_url.as_deref() {
+            if Self::contains_packycode_keyword(site) {
+                return true;
+            }
+        }
+
+        // 策略 4: 检查 Base URL
+        if let Some(base_url) = provider
+            .settings_config
+            .pointer("/env/GOOGLE_GEMINI_BASE_URL")
+            .and_then(|v| v.as_str())
+        {
+            if Self::contains_packycode_keyword(base_url) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// 检测供应商是否为 Google 官方 Gemini（使用 OAuth 认证）
+    ///
+    /// Google 官方 Gemini 使用 OAuth 个人认证，不需要 API Key。
+    ///
+    /// # 检测规则（优先级从高到低）
+    ///
+    /// 1. **Partner Promotion Key**（最可靠）:
+    ///    - `provider.meta.partner_promotion_key == "google-official"`
+    ///
+    /// 2. **供应商名称**:
+    ///    - 名称完全等于 "google"（不区分大小写）
+    ///    - 或名称以 "google " 开头（例如 "Google Official"）
+    ///
+    /// # OAuth vs API Key
+    ///
+    /// - **OAuth 模式**: `security.auth.selectedType = "oauth-personal"`
+    ///   - 用户需要通过浏览器登录 Google 账号
+    ///   - 不需要在 `.env` 文件中配置 API Key
+    ///
+    /// - **API Key 模式**: `security.auth.selectedType = "gemini-api-key"`
+    ///   - 用于第三方中转服务（如 PackyCode）
+    ///   - 需要在 `.env` 文件中配置 `GEMINI_API_KEY`
+    fn is_google_official_gemini(provider: &Provider) -> bool {
+        // 策略 1: 检查 partner_promotion_key（最可靠）
+        if provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.partner_promotion_key.as_deref())
+            .is_some_and(|key| key.eq_ignore_ascii_case(Self::GOOGLE_OFFICIAL_PARTNER_KEY))
+        {
+            return true;
+        }
+
+        // 策略 2: 检查名称匹配（备用方案）
+        let name_lower = provider.name.to_ascii_lowercase();
+        name_lower == "google" || name_lower.starts_with("google ")
+    }
+
+    pub(crate) fn is_google_official_gemini_provider(provider: &Provider) -> bool {
+        Self::is_google_official_gemini(provider)
+    }
+
+    /// 确保 PackyCode Gemini 供应商的安全标志正确设置
+    ///
+    /// PackyCode 是官方合作伙伴，使用 API Key 认证模式。
+    ///
+    /// # 写入两处 settings.json 的原因
+    ///
+    /// 1. **`~/.cc-switch/settings.json`** (应用级配置):
+    ///    - CC-Switch 应用的全局设置
+    ///    - 确保应用知道当前使用的认证类型
+    ///    - 用于 UI 显示和其他应用逻辑
+    ///
+    /// 2. **`~/.gemini/settings.json`** (Gemini 客户端配置):
+    ///    - Gemini CLI 客户端读取的配置文件
+    ///    - 直接影响 Gemini 客户端的认证行为
+    ///    - 确保 Gemini 使用正确的认证方式连接 API
+    ///
+    /// # 设置的值
+    ///
+    /// ```json
+    /// {
+    ///   "security": {
+    ///     "auth": {
+    ///       "selectedType": "gemini-api-key"
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// # 错误处理
+    ///
+    /// 如果供应商不是 PackyCode，函数立即返回 `Ok(())`，不做任何操作。
+    pub(crate) fn ensure_packycode_security_flag(provider: &Provider) -> Result<(), AppError> {
+        if !Self::is_packycode_gemini(provider) {
+            return Ok(());
+        }
+
+        // 写入应用级别的 settings.json (~/.cc-switch/settings.json)
+        settings::ensure_security_auth_selected_type(Self::PACKYCODE_SECURITY_SELECTED_TYPE)?;
+
+        // 写入 Gemini 目录的 settings.json (~/.gemini/settings.json)
+        use crate::gemini_config::write_packycode_settings;
+        write_packycode_settings()?;
+
+        Ok(())
+    }
+
+    /// 确保 Google 官方 Gemini 供应商的安全标志正确设置（OAuth 模式）
+    ///
+    /// Google 官方 Gemini 使用 OAuth 个人认证，不需要 API Key。
+    ///
+    /// # 写入两处 settings.json 的原因
+    ///
+    /// 同 `ensure_packycode_security_flag`，需要同时配置应用级和客户端级设置。
+    ///
+    /// # 设置的值
+    ///
+    /// ```json
+    /// {
+    ///   "security": {
+    ///     "auth": {
+    ///       "selectedType": "oauth-personal"
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// # OAuth 认证流程
+    ///
+    /// 1. 用户切换到 Google 官方供应商
+    /// 2. CC-Switch 设置 `selectedType = "oauth-personal"`
+    /// 3. 用户首次使用 Gemini CLI 时，会自动打开浏览器进行 OAuth 登录
+    /// 4. 登录成功后，凭证保存在 Gemini 的 credential store 中
+    /// 5. 后续请求自动使用保存的凭证
+    ///
+    /// # 错误处理
+    ///
+    /// 如果供应商不是 Google 官方，函数立即返回 `Ok(())`，不做任何操作。
+    pub(crate) fn ensure_google_oauth_security_flag(provider: &Provider) -> Result<(), AppError> {
+        if !Self::is_google_official_gemini(provider) {
+            return Ok(());
+        }
+
+        // 写入应用级别的 settings.json (~/.cc-switch/settings.json)
+        settings::ensure_security_auth_selected_type(Self::GOOGLE_OAUTH_SECURITY_SELECTED_TYPE)?;
+
+        // 写入 Gemini 目录的 settings.json (~/.gemini/settings.json)
+        use crate::gemini_config::write_google_oauth_settings;
+        write_google_oauth_settings()?;
+
+        Ok(())
+    }
+
+    /// 归一化 Claude 模型键：读旧键(ANTHROPIC_SMALL_FAST_MODEL)，写新键(DEFAULT_*), 并删除旧键
+    fn normalize_claude_models_in_value(settings: &mut Value) -> bool {
+        let mut changed = false;
+        let env = match settings.get_mut("env") {
+            Some(v) if v.is_object() => v.as_object_mut().unwrap(),
+            _ => return changed,
+        };
+
+        let model = env
+            .get("ANTHROPIC_MODEL")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let small_fast = env
+            .get("ANTHROPIC_SMALL_FAST_MODEL")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let current_haiku = env
+            .get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let current_sonnet = env
+            .get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let current_opus = env
+            .get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let target_haiku = current_haiku
+            .or_else(|| small_fast.clone())
+            .or_else(|| model.clone());
+        let target_sonnet = current_sonnet
+            .or_else(|| model.clone())
+            .or_else(|| small_fast.clone());
+        let target_opus = current_opus
+            .or_else(|| model.clone())
+            .or_else(|| small_fast.clone());
+
+        if env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").is_none() {
+            if let Some(v) = target_haiku {
+                env.insert(
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                    Value::String(v),
+                );
+                changed = true;
+            }
+        }
+        if env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none() {
+            if let Some(v) = target_sonnet {
+                env.insert(
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+                    Value::String(v),
+                );
+                changed = true;
+            }
+        }
+        if env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none() {
+            if let Some(v) = target_opus {
+                env.insert("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), Value::String(v));
+                changed = true;
+            }
+        }
+
+        if env.remove("ANTHROPIC_SMALL_FAST_MODEL").is_some() {
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn normalize_provider_if_claude(app_type: &AppType, provider: &mut Provider) {
+        if matches!(app_type, AppType::Claude) {
+            let mut v = provider.settings_config.clone();
+            if Self::normalize_claude_models_in_value(&mut v) {
+                provider.settings_config = v;
+            }
+        }
+    }
+    fn run_transaction<R, F>(state: &AppState, f: F) -> Result<R, AppError>
+    where
+        F: FnOnce(&mut MultiAppConfig) -> Result<(R, Option<PostCommitAction>), AppError>,
+    {
+        let original = state.load_config()?;
+        let mut next = original.clone();
+        let (result, action) = f(&mut next)?;
+        state.replace_config(&next)?;
+
+        if let Some(action) = action {
+            if let Err(err) = Self::apply_post_commit(state, &action) {
+                if let Err(rollback_err) =
+                    Self::rollback_after_failure(state, original.clone(), action.backup.clone())
+                {
+                    return Err(AppError::localized(
+                        "post_commit.rollback_failed",
+                        format!("后置操作失败: {err}；回滚失败: {rollback_err}"),
+                        format!("Post-commit step failed: {err}; rollback failed: {rollback_err}"),
+                    ));
+                }
+                return Err(err);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn restore_config_only(state: &AppState, snapshot: MultiAppConfig) -> Result<(), AppError> {
+        state.replace_config(&snapshot)
+    }
+
+    fn rollback_after_failure(
+        state: &AppState,
+        snapshot: MultiAppConfig,
+        backup: LiveSnapshot,
+    ) -> Result<(), AppError> {
+        Self::restore_config_only(state, snapshot)?;
+        backup.restore()
+    }
+
+    fn apply_post_commit(state: &AppState, action: &PostCommitAction) -> Result<(), AppError> {
+        let proxy_takeover_active = Self::proxy_takeover_enabled(&action.app_type);
+        if !proxy_takeover_active {
+            Self::write_live_snapshot(state, &action.app_type, &action.provider)?;
+            if action.set_additive_default && matches!(action.app_type, AppType::OpenClaw) {
+                Self::set_openclaw_default(&action.provider)?;
+            }
+        }
+        if action.sync_mcp {
+            // 使用 v3.7.0 统一的 MCP 同步机制，支持所有应用
+            use crate::services::mcp::McpService;
+            McpService::sync_all_enabled(state)?;
+        }
+        if action.refresh_snapshot && !proxy_takeover_active {
+            Self::refresh_provider_snapshot(state, &action.app_type, &action.provider.id)?;
+        }
+        Ok(())
+    }
+
+    fn proxy_takeover_enabled(app_type: &AppType) -> bool {
+        #[cfg(feature = "web-server")]
+        {
+            let proxy = settings::get_settings().proxy;
+            match app_type {
+                AppType::Claude => proxy.apps.claude.enabled,
+                AppType::Codex => proxy.apps.codex.enabled,
+                AppType::Gemini => proxy.apps.gemini.enabled,
+                AppType::Opencode => proxy.apps.opencode.enabled,
+                AppType::ClaudeDesktop
+                | AppType::OpenClaw
+                | AppType::GrokBuild
+                | AppType::Hermes => false,
+            }
+        }
+
+        #[cfg(not(feature = "web-server"))]
+        {
+            let _ = app_type;
+            false
+        }
+    }
+
+    fn refresh_provider_snapshot(
+        state: &AppState,
+        app_type: &AppType,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        match app_type {
+            AppType::Claude => {
+                let settings_path = get_claude_settings_path()?;
+                if !settings_path.exists() {
+                    return Err(AppError::localized(
+                        "claude.live.missing",
+                        "Claude 设置文件不存在，无法刷新快照",
+                        "Claude settings file missing; cannot refresh snapshot",
+                    ));
+                }
+                let mut live_after = read_json_file::<Value>(&settings_path)?;
+                let _ = Self::normalize_claude_models_in_value(&mut live_after);
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            target.settings_config = live_after;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            AppType::Codex => {
+                let auth_path = get_codex_auth_path()?;
+                if !auth_path.exists() {
+                    return Err(AppError::localized(
+                        "codex.live.missing",
+                        "Codex auth.json 不存在，无法刷新快照",
+                        "Codex auth.json missing; cannot refresh snapshot",
+                    ));
+                }
+                let auth: Value = read_json_file(&auth_path)?;
+                let cfg_text = crate::codex_config::read_and_validate_codex_config_text()?;
+
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            let obj = target.settings_config.as_object_mut().ok_or_else(|| {
+                                AppError::Config(format!(
+                                    "供应商 {provider_id} 的 Codex 配置必须是 JSON 对象"
+                                ))
+                            })?;
+                            obj.insert("auth".to_string(), auth.clone());
+                            obj.insert("config".to_string(), Value::String(cfg_text.clone()));
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            AppType::Gemini => {
+                use crate::gemini_config::{
+                    env_to_json, get_gemini_env_path, get_gemini_settings_path, read_gemini_env,
+                };
+
+                let env_path = get_gemini_env_path()?;
+                if !env_path.exists() {
+                    return Err(AppError::localized(
+                        "gemini.live.missing",
+                        "Gemini .env 文件不存在，无法刷新快照",
+                        "Gemini .env file missing; cannot refresh snapshot",
+                    ));
+                }
+                let env_map = read_gemini_env()?;
+                let mut live_after = env_to_json(&env_map);
+
+                let settings_path = get_gemini_settings_path()?;
+                let config_value = if settings_path.exists() {
+                    read_json_file(&settings_path)?
+                } else {
+                    json!({})
+                };
+
+                if let Some(obj) = live_after.as_object_mut() {
+                    obj.insert("config".to_string(), config_value);
+                }
+
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            target.settings_config = live_after;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            AppType::Opencode => {
+                let config_path = crate::opencode_config::get_opencode_config_path();
+                if !config_path.exists() {
+                    return Err(AppError::localized(
+                        "opencode.live.missing",
+                        "OpenCode 配置文件不存在，无法刷新快照",
+                        "OpenCode config file missing; cannot refresh snapshot",
+                    ));
+                }
+
+                let live_after = crate::opencode_config::read_opencode_config()?;
+                let fragment = live_after
+                    .get("provider")
+                    .and_then(|value| value.get(provider_id))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            target.settings_config = fragment;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            AppType::OpenClaw => {
+                let fragment =
+                    crate::openclaw_config::get_provider(provider_id)?.ok_or_else(|| {
+                        AppError::localized(
+                            "openclaw.live.missing",
+                            format!("OpenClaw live 配置中缺少供应商 {provider_id}"),
+                            format!("OpenClaw live config is missing provider {provider_id}"),
+                        )
+                    })?;
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            target.settings_config = fragment;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            AppType::ClaudeDesktop => {}
+            AppType::GrokBuild => {
+                let config_path = crate::grok_config::get_grok_config_path();
+                if !config_path.exists() {
+                    return Err(AppError::localized(
+                        "grokbuild.live.missing",
+                        "Grok Build 配置文件不存在，无法刷新快照",
+                        "Grok Build config file missing; cannot refresh snapshot",
+                    ));
+                }
+
+                let live_after = crate::grok_config::read_grok_live_settings()?;
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            target.settings_config = live_after;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            AppType::Hermes => {
+                let config_path = crate::hermes_config::get_hermes_config_path();
+                if !config_path.exists() {
+                    return Err(AppError::localized(
+                        "hermes.live.missing",
+                        "Hermes 配置文件不存在，无法刷新快照",
+                        "Hermes config file missing; cannot refresh snapshot",
+                    ));
+                }
+
+                let live_after = crate::hermes_config::get_provider(provider_id)?.ok_or_else(|| {
+                    AppError::localized(
+                        "hermes.live.provider_missing",
+                        format!("Hermes live 配置中缺少供应商 {provider_id}"),
+                        format!("Hermes live config is missing provider {provider_id}"),
+                    )
+                })?;
+                state.update_config(|cfg| {
+                    if let Some(manager) = cfg.get_manager_mut(app_type) {
+                        if let Some(target) = manager.providers.get_mut(provider_id) {
+                            target.settings_config = live_after;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_live_snapshot(app_type: &AppType) -> Result<LiveSnapshot, AppError> {
+        match app_type {
+            AppType::Claude => {
+                let path = get_claude_settings_path()?;
+                let settings = if path.exists() {
+                    Some(read_json_file::<Value>(&path)?)
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::Claude { settings })
+            }
+            AppType::Codex => {
+                let auth_path = get_codex_auth_path()?;
+                let config_path = get_codex_config_path()?;
+                let auth = if auth_path.exists() {
+                    Some(read_json_file::<Value>(&auth_path)?)
+                } else {
+                    None
+                };
+                let config = if config_path.exists() {
+                    Some(
+                        std::fs::read_to_string(&config_path)
+                            .map_err(|e| AppError::io(&config_path, e))?,
+                    )
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::Codex { auth, config })
+            }
+            AppType::Gemini => {
+                // 新增
+                use crate::gemini_config::{
+                    get_gemini_env_path, get_gemini_settings_path, read_gemini_env,
+                };
+                let path = get_gemini_env_path()?;
+                let env = if path.exists() {
+                    Some(read_gemini_env()?)
+                } else {
+                    None
+                };
+                let settings_path = get_gemini_settings_path()?;
+                let config = if settings_path.exists() {
+                    Some(read_json_file(&settings_path)?)
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::Gemini { env, config })
+            }
+            AppType::Opencode => {
+                let path = crate::opencode_config::get_opencode_config_path();
+                let config = if path.exists() {
+                    Some(read_json_file::<Value>(&path)?)
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::Opencode { config })
+            }
+            AppType::OpenClaw => {
+                let path = crate::openclaw_config::get_openclaw_config_path();
+                let config = if path.exists() {
+                    Some(std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?)
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::OpenClaw { config })
+            }
+            AppType::ClaudeDesktop => Ok(LiveSnapshot::Noop),
+            AppType::GrokBuild => {
+                let path = crate::grok_config::get_grok_config_path();
+                let config = if path.exists() {
+                    Some(
+                        std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?,
+                    )
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::GrokBuild { config })
+            }
+            AppType::Hermes => {
+                let path = crate::hermes_config::get_hermes_config_path();
+                let config = if path.exists() {
+                    let yaml = crate::hermes_config::read_hermes_config()?;
+                    Some(crate::hermes_config::yaml_to_json(&yaml)?)
+                } else {
+                    None
+                };
+                Ok(LiveSnapshot::Hermes { config })
+            }
+        }
+    }
+
+    /// 列出指定应用下的所有供应商
+    pub fn list(
+        state: &AppState,
+        app_type: AppType,
+    ) -> Result<HashMap<String, Provider>, AppError> {
+        let config = state.load_config()?;
+        let manager = config
+            .get_manager(&app_type)
+            .ok_or_else(|| Self::app_not_found(&app_type))?;
+        Ok(manager.get_all_providers().clone())
+    }
+
+    /// 获取当前供应商 ID
+    pub fn current(state: &AppState, app_type: AppType) -> Result<String, AppError> {
+        let config = state.load_config()?;
+        let manager = config
+            .get_manager(&app_type)
+            .ok_or_else(|| Self::app_not_found(&app_type))?;
+        Ok(manager.current.clone())
+    }
+
+    /// 获取备用供应商 ID
+    pub fn backup(state: &AppState, app_type: AppType) -> Result<Option<String>, AppError> {
+        let config = state.load_config()?;
+        let manager = config
+            .get_manager(&app_type)
+            .ok_or_else(|| Self::app_not_found(&app_type))?;
+        Ok(manager.backup_current.clone())
+    }
+
+    /// 设置备用供应商 ID
+    pub fn set_backup(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: Option<String>,
+    ) -> Result<(), AppError> {
+        Self::run_transaction(state, move |config| {
+            let manager = config
+                .get_manager(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+            if let Some(ref id) = provider_id {
+                if !manager.providers.contains_key(id) {
+                    return Err(AppError::localized(
+                        "provider.not_found",
+                        format!("供应商不存在: {id}"),
+                        format!("Provider not found: {id}"),
+                    ));
+                }
+            }
+
+            if let Some(manager) = config.get_manager_mut(&app_type) {
+                manager.backup_current = provider_id.clone();
+            }
+
+            Ok(((), None))
+        })
+    }
+
+    /// 新增供应商
+    pub fn add(state: &AppState, app_type: AppType, provider: Provider) -> Result<bool, AppError> {
+        let mut provider = provider;
+        // 归一化 Claude 模型键
+        Self::normalize_provider_if_claude(&app_type, &mut provider);
+        Self::validate_provider_settings(&app_type, &provider)?;
+
+        let app_type_clone = app_type.clone();
+        let provider_clone = provider.clone();
+
+        Self::run_transaction(state, move |config| {
+            config.ensure_app(&app_type_clone);
+            let manager = config
+                .get_manager_mut(&app_type_clone)
+                .ok_or_else(|| Self::app_not_found(&app_type_clone))?;
+
+            if matches!(app_type_clone, AppType::OpenClaw)
+                && manager.providers.contains_key(&provider_clone.id)
+            {
+                return Err(AppError::localized(
+                    "provider.duplicate_id",
+                    format!("OpenClaw Provider Key 已存在: {}", provider_clone.id),
+                    format!(
+                        "OpenClaw Provider Key already exists: {}",
+                        provider_clone.id
+                    ),
+                ));
+            }
+
+            let is_current = manager.current == provider_clone.id;
+            manager
+                .providers
+                .insert(provider_clone.id.clone(), provider_clone.clone());
+
+            let action = if is_current || matches!(app_type_clone, AppType::OpenClaw) {
+                let backup = Self::capture_live_snapshot(&app_type_clone)?;
+                Some(PostCommitAction {
+                    app_type: app_type_clone.clone(),
+                    provider: provider_clone.clone(),
+                    backup,
+                    sync_mcp: false,
+                    refresh_snapshot: false,
+                    set_additive_default: is_current,
+                })
+            } else {
+                None
+            };
+
+            Ok((true, action))
+        })
+    }
+
+    /// 更新供应商
+    pub fn update(
+        state: &AppState,
+        app_type: AppType,
+        provider: Provider,
+    ) -> Result<bool, AppError> {
+        let mut provider = provider;
+        // 归一化 Claude 模型键
+        Self::normalize_provider_if_claude(&app_type, &mut provider);
+        Self::validate_provider_settings(&app_type, &provider)?;
+        let provider_id = provider.id.clone();
+        let app_type_clone = app_type.clone();
+        let provider_clone = provider.clone();
+
+        Self::run_transaction(state, move |config| {
+            let manager = config
+                .get_manager_mut(&app_type_clone)
+                .ok_or_else(|| Self::app_not_found(&app_type_clone))?;
+
+            if !manager.providers.contains_key(&provider_id) {
+                return Err(AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                ));
+            }
+
+            let is_current = manager.current == provider_id;
+            let merged = if let Some(existing) = manager.providers.get(&provider_id) {
+                let mut updated = provider_clone.clone();
+                match (existing.meta.as_ref(), updated.meta.take()) {
+                    // 前端未提供 meta，表示不修改，沿用旧值
+                    (Some(old_meta), None) => {
+                        updated.meta = Some(old_meta.clone());
+                    }
+                    (None, None) => {
+                        updated.meta = None;
+                    }
+                    // 前端提供的 meta 视为权威，直接覆盖（其中 custom_endpoints 允许是空，表示删除所有自定义端点）
+                    (_old, Some(new_meta)) => {
+                        updated.meta = Some(new_meta);
+                    }
+                }
+                updated
+            } else {
+                provider_clone.clone()
+            };
+
+            let live_provider = merged.clone();
+            manager.providers.insert(provider_id.clone(), merged);
+
+            let action = if is_current || matches!(app_type_clone, AppType::OpenClaw) {
+                let backup = Self::capture_live_snapshot(&app_type_clone)?;
+                Some(PostCommitAction {
+                    app_type: app_type_clone.clone(),
+                    provider: live_provider,
+                    backup,
+                    sync_mcp: true,
+                    refresh_snapshot: true,
+                    set_additive_default: is_current,
+                })
+            } else {
+                None
+            };
+
+            Ok((true, action))
+        })
+    }
+
+    pub fn preview_openclaw_provider_reconciliation(
+        state: &AppState,
+    ) -> Result<OpenClawReconciliationPreview, AppError> {
+        let etag_before = crate::openclaw_config::get_config_etag()?;
+        let live = crate::openclaw_config::get_providers()?;
+        let etag_after = crate::openclaw_config::get_config_etag()?;
+        if etag_before != etag_after {
+            return Err(AppError::Conflict(
+                "OpenClaw config changed while it was being scanned".to_string(),
+            ));
+        }
+
+        let config = state.load_config()?;
+        let stored = config
+            .get_manager(&AppType::OpenClaw)
+            .map(|manager| &manager.providers);
+        let stored_count = stored.map_or(0, HashMap::len);
+        let mut items = Vec::with_capacity(live.len());
+
+        for (provider_id, fragment) in live {
+            let parsed = serde_json::from_value::<crate::openclaw_config::OpenClawProviderConfig>(
+                fragment.clone(),
+            );
+            let existing = stored.and_then(|providers| providers.get(&provider_id));
+            let live_config_managed = existing
+                .and_then(|provider| provider.meta.as_ref())
+                .and_then(|meta| meta.live_config_managed)
+                .unwrap_or(false);
+
+            let (display_name, model_count, has_api_key, status, reason) = match parsed {
+                Ok(provider)
+                    if Self::valid_openclaw_provider_id(&provider_id)
+                        && !provider.models.is_empty() =>
+                {
+                    let display_name = Self::openclaw_live_display_name(&provider_id, &provider);
+                    let model_count = provider.models.len();
+                    let has_api_key = provider
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
+                    let status = match existing {
+                        None => OpenClawReconciliationStatus::New,
+                        Some(existing)
+                            if Self::openclaw_fragment(existing)
+                                .map(|value| value == fragment)
+                                .unwrap_or(false) =>
+                        {
+                            OpenClawReconciliationStatus::Unchanged
+                        }
+                        Some(_) => OpenClawReconciliationStatus::Changed,
+                    };
+                    (display_name, model_count, has_api_key, status, None)
+                }
+                _ => (
+                    provider_id.clone(),
+                    0,
+                    false,
+                    OpenClawReconciliationStatus::Invalid,
+                    Some("Provider must have a valid ID and at least one model".to_string()),
+                ),
+            };
+
+            items.push(OpenClawReconciliationItem {
+                provider_id,
+                display_name,
+                status,
+                model_count,
+                has_api_key,
+                live_config_managed,
+                reason,
+            });
+        }
+        items.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
+
+        Ok(OpenClawReconciliationPreview {
+            etag: etag_after,
+            live_count: items.len(),
+            stored_count,
+            items,
+        })
+    }
+
+    pub fn apply_openclaw_provider_reconciliation(
+        state: &AppState,
+        provider_ids: &[String],
+        update_existing: bool,
+        expected_etag: Option<&str>,
+    ) -> Result<OpenClawReconciliationOutcome, AppError> {
+        if provider_ids.len() > 500 {
+            return Err(AppError::InvalidInput(
+                "Too many OpenClaw providers selected".to_string(),
+            ));
+        }
+        let selected = provider_ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .collect::<HashSet<_>>();
+        if selected.len() != provider_ids.len()
+            || selected
+                .iter()
+                .any(|id| !Self::valid_openclaw_provider_id(id))
+        {
+            return Err(AppError::InvalidInput(
+                "OpenClaw provider selection contains invalid or duplicate IDs".to_string(),
+            ));
+        }
+
+        let etag_before = crate::openclaw_config::get_config_etag()?;
+        if expected_etag.is_some_and(|expected| expected != etag_before) {
+            return Err(AppError::Conflict(
+                "OpenClaw config changed since reconciliation was previewed".to_string(),
+            ));
+        }
+        let live = crate::openclaw_config::get_providers()?;
+        let etag_after = crate::openclaw_config::get_config_etag()?;
+        if etag_before != etag_after {
+            return Err(AppError::Conflict(
+                "OpenClaw config changed while reconciliation was applied".to_string(),
+            ));
+        }
+        if let Some(missing) = selected.iter().find(|id| !live.contains_key(*id)) {
+            return Err(AppError::InvalidInput(format!(
+                "OpenClaw provider is no longer present: {missing}"
+            )));
+        }
+
+        let default_provider = crate::openclaw_config::get_default_model()?
+            .and_then(|model| model.primary.split_once('/').map(|(id, _)| id.to_string()));
+        let now = Self::now_millis();
+        let etag = etag_after.clone();
+
+        state.update_config(move |config| {
+            config.ensure_app(&AppType::OpenClaw);
+            let manager = config
+                .get_manager_mut(&AppType::OpenClaw)
+                .ok_or_else(|| Self::app_not_found(&AppType::OpenClaw))?;
+            let mut outcome = OpenClawReconciliationOutcome {
+                etag: etag.clone(),
+                ..Default::default()
+            };
+            let mut next_sort_index = manager
+                .providers
+                .values()
+                .filter_map(|provider| provider.sort_index)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+
+            for (provider_id, fragment) in live {
+                if !selected.contains(&provider_id) {
+                    outcome.ignored += 1;
+                    continue;
+                }
+                let Ok(typed) = serde_json::from_value::<
+                    crate::openclaw_config::OpenClawProviderConfig,
+                >(fragment.clone()) else {
+                    outcome.invalid += 1;
+                    continue;
+                };
+                if typed.models.is_empty() || !Self::valid_openclaw_provider_id(&provider_id) {
+                    outcome.invalid += 1;
+                    continue;
+                }
+
+                if let Some(existing) = manager.providers.get_mut(&provider_id) {
+                    let unchanged = Self::openclaw_fragment(existing)
+                        .map(|value| value == fragment)
+                        .unwrap_or(false);
+                    if unchanged {
+                        outcome.unchanged += 1;
+                        continue;
+                    }
+                    if !update_existing {
+                        outcome.ignored += 1;
+                        continue;
+                    }
+                    existing.settings_config = fragment;
+                    existing
+                        .meta
+                        .get_or_insert_with(ProviderMeta::default)
+                        .live_config_managed = Some(true);
+                    outcome.updated += 1;
+                    continue;
+                }
+
+                let mut provider = Provider::with_id(
+                    provider_id.clone(),
+                    Self::openclaw_live_display_name(&provider_id, &typed),
+                    fragment,
+                    None,
+                );
+                provider.category = Some("custom".to_string());
+                provider.created_at = Some(now);
+                provider.sort_index = Some(next_sort_index);
+                next_sort_index = next_sort_index.saturating_add(1);
+                provider.meta = Some(ProviderMeta {
+                    live_config_managed: Some(true),
+                    ..Default::default()
+                });
+                manager.providers.insert(provider_id, provider);
+                outcome.imported += 1;
+            }
+
+            if let Some(default_provider) =
+                default_provider.filter(|id| manager.providers.contains_key(id))
+            {
+                manager.current = default_provider;
+            } else if manager.current.is_empty()
+                || !manager.providers.contains_key(&manager.current)
+            {
+                manager.current = manager.providers.keys().min().cloned().unwrap_or_default();
+            }
+            Ok(outcome)
+        })
+    }
+
+    pub fn import_openclaw_providers_from_live(state: &AppState) -> Result<usize, AppError> {
+        let preview = Self::preview_openclaw_provider_reconciliation(state)?;
+        let provider_ids = preview
+            .items
+            .iter()
+            .filter(|item| {
+                item.status == OpenClawReconciliationStatus::New
+                    || (item.status == OpenClawReconciliationStatus::Changed
+                        && item.live_config_managed)
+            })
+            .map(|item| item.provider_id.clone())
+            .collect::<Vec<_>>();
+        if provider_ids.is_empty() {
+            return Ok(0);
+        }
+        let outcome = Self::apply_openclaw_provider_reconciliation(
+            state,
+            &provider_ids,
+            true,
+            Some(&preview.etag),
+        )?;
+        Ok(outcome.imported + outcome.updated)
+    }
+
+    fn valid_openclaw_provider_id(id: &str) -> bool {
+        let trimmed = id.trim();
+        !trimmed.is_empty()
+            && trimmed.len() <= 128
+            && trimmed != "."
+            && trimmed != ".."
+            && !trimmed.contains('/')
+            && !trimmed.contains('\\')
+    }
+
+    fn openclaw_live_display_name(
+        provider_id: &str,
+        provider: &crate::openclaw_config::OpenClawProviderConfig,
+    ) -> String {
+        provider
+            .models
+            .first()
+            .and_then(|model| model.name.as_deref().or(Some(model.id.as_str())))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(provider_id)
+            .to_string()
+    }
+
+    /// 导入当前 live 配置为默认供应商
+    pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<(), AppError> {
+        {
+            let config = state.load_config()?;
+            if let Some(manager) = config.get_manager(&app_type) {
+                if !manager.get_all_providers().is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let settings_config = match app_type {
+            AppType::Codex => {
+                let auth_path = get_codex_auth_path()?;
+                if !auth_path.exists() {
+                    return Err(AppError::localized(
+                        "codex.live.missing",
+                        "Codex 配置文件不存在",
+                        "Codex configuration file is missing",
+                    ));
+                }
+                let auth: Value = read_json_file(&auth_path)?;
+                let config_str = crate::codex_config::read_and_validate_codex_config_text()?;
+                json!({ "auth": auth, "config": config_str })
+            }
+            AppType::Claude => {
+                let settings_path = get_claude_settings_path()?;
+                if !settings_path.exists() {
+                    return Err(AppError::localized(
+                        "claude.live.missing",
+                        "Claude Code 配置文件不存在",
+                        "Claude settings file is missing",
+                    ));
+                }
+                let mut v = read_json_file::<Value>(&settings_path)?;
+                let _ = Self::normalize_claude_models_in_value(&mut v);
+                v
+            }
+            AppType::Gemini => {
+                use crate::gemini_config::{
+                    env_to_json, get_gemini_env_path, get_gemini_settings_path, read_gemini_env,
+                };
+
+                // 读取 .env 文件（环境变量）；如果缺失则使用空配置，避免直接报错
+                let env_path = get_gemini_env_path()?;
+                if !env_path.exists() {
+                    log::warn!("Gemini .env file missing when importing defaults; using empty env");
+                }
+
+                let env_map = read_gemini_env()?;
+                let env_json = env_to_json(&env_map);
+                let env_obj = env_json.get("env").cloned().unwrap_or_else(|| json!({}));
+
+                // 读取 settings.json 文件（MCP 配置等）
+                let settings_path = get_gemini_settings_path()?;
+                let config_obj = if settings_path.exists() {
+                    read_json_file(&settings_path)?
+                } else {
+                    json!({})
+                };
+
+                // 返回完整结构：{ "env": {...}, "config": {...} }
+                json!({
+                    "env": env_obj,
+                    "config": config_obj
+                })
+            }
+            AppType::Opencode => {
+                let providers = crate::opencode_config::get_providers()?;
+                if providers.is_empty() {
+                    return Err(AppError::localized(
+                        "opencode.live.missing",
+                        "OpenCode 配置文件不存在或不包含 provider",
+                        "OpenCode config missing or has no providers",
+                    ));
+                }
+
+                let mut provider_entries: Vec<(String, Value)> = providers.into_iter().collect();
+                provider_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                state.update_config(|cfg| {
+                    let manager = cfg
+                        .get_manager_mut(&app_type)
+                        .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+                    for (provider_id, settings_config) in provider_entries {
+                        let mut provider = Provider::with_id(
+                            provider_id.clone(),
+                            provider_id.clone(),
+                            settings_config,
+                            None,
+                        );
+                        provider.category = Some("custom".to_string());
+                        manager.providers.insert(provider.id.clone(), provider);
+                    }
+
+                    let preferred_current = if manager.providers.contains_key("default") {
+                        Some("default".to_string())
+                    } else {
+                        manager.providers.keys().min().cloned()
+                    };
+                    manager.current = preferred_current.unwrap_or_default();
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+            AppType::OpenClaw => {
+                let mut provider_entries = crate::openclaw_config::get_providers()?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if provider_entries.is_empty() {
+                    return Err(AppError::localized(
+                        "openclaw.live.missing",
+                        "OpenClaw 配置文件不存在或不包含 provider",
+                        "OpenClaw config is missing or contains no providers",
+                    ));
+                }
+                provider_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                let default_provider = crate::openclaw_config::get_default_model()?
+                    .and_then(|model| model.primary.split('/').next().map(ToString::to_string));
+
+                state.update_config(|cfg| {
+                    let manager = cfg
+                        .get_manager_mut(&app_type)
+                        .ok_or_else(|| Self::app_not_found(&app_type))?;
+                    for (provider_id, settings_config) in provider_entries {
+                        let display_name = settings_config
+                            .get("models")
+                            .and_then(Value::as_array)
+                            .and_then(|models| models.first())
+                            .and_then(|model| model.get("name").or_else(|| model.get("id")))
+                            .and_then(Value::as_str)
+                            .unwrap_or(&provider_id)
+                            .to_string();
+                        let mut provider = Provider::with_id(
+                            provider_id.clone(),
+                            display_name,
+                            settings_config,
+                            None,
+                        );
+                        provider.category = Some("custom".to_string());
+                        manager.providers.insert(provider_id, provider);
+                    }
+                    manager.current = default_provider
+                        .filter(|id| manager.providers.contains_key(id))
+                        .or_else(|| manager.providers.keys().min().cloned())
+                        .unwrap_or_default();
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+            AppType::ClaudeDesktop => {
+                return Err(Self::app_not_supported(&app_type));
+            }
+            AppType::GrokBuild => {
+                let config_path = crate::grok_config::get_grok_config_path();
+                if !config_path.exists() {
+                    return Err(AppError::localized(
+                        "grokbuild.live.missing",
+                        "Grok Build 配置文件不存在",
+                        "Grok Build config file is missing",
+                    ));
+                }
+                crate::grok_config::read_grok_live_settings()?
+            }
+            AppType::Hermes => {
+                let config_path = crate::hermes_config::get_hermes_config_path();
+                if !config_path.exists() {
+                    return Err(AppError::localized(
+                        "hermes.live.missing",
+                        "Hermes 配置文件不存在",
+                        "Hermes config file is missing",
+                    ));
+                }
+                let yaml = crate::hermes_config::read_hermes_config()?;
+                crate::hermes_config::yaml_to_json(&yaml)?
+            }
+        };
+
+        let mut provider = Provider::with_id(
+            "default".to_string(),
+            "default".to_string(),
+            settings_config,
+            None,
+        );
+        provider.category = Some("custom".to_string());
+
+        state.update_config(|config| {
+            let manager = config
+                .get_manager_mut(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+            manager
+                .providers
+                .insert(provider.id.clone(), provider.clone());
+            manager.current = provider.id.clone();
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Sync live settings into the cached provider snapshot without switching current.
+    pub fn sync_default_provider_from_live(
+        state: &AppState,
+        app_type: AppType,
+        mut live_settings: Value,
+    ) -> Result<(), AppError> {
+        if matches!(app_type, AppType::Claude) {
+            let _ = Self::normalize_claude_models_in_value(&mut live_settings);
+        }
+
+        match app_type {
+            AppType::Opencode => {
+                return Self::sync_current_opencode_provider_from_live(state, live_settings);
+            }
+            AppType::OpenClaw => {
+                let providers = live_settings
+                    .pointer("/models/providers")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                return state.update_config(|config| {
+                    let manager = config
+                        .get_manager_mut(&app_type)
+                        .ok_or_else(|| Self::app_not_found(&app_type))?;
+                    for (provider_id, fragment) in providers {
+                        if let Some(existing) = manager.providers.get_mut(&provider_id) {
+                            existing.settings_config = fragment;
+                        } else {
+                            let mut provider = Provider::with_id(
+                                provider_id.clone(),
+                                provider_id.clone(),
+                                fragment,
+                                None,
+                            );
+                            provider.category = Some("custom".to_string());
+                            manager.providers.insert(provider_id, provider);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            AppType::GrokBuild => {
+                return Self::sync_current_provider_from_live(state, app_type, live_settings);
+            }
+            AppType::Hermes => {
+                return Self::sync_hermes_provider_from_live(state, live_settings);
+            }
+            AppType::ClaudeDesktop => {
+                return Err(Self::app_not_supported(&app_type));
+            }
+            AppType::Claude | AppType::Codex | AppType::Gemini => {}
+        }
+
+        state.update_config(|config| {
+            let manager = config
+                .get_manager_mut(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+            if let Some(existing) = manager.providers.get_mut("default") {
+                existing.settings_config = live_settings;
+                if existing.category.is_none() {
+                    existing.category = Some("custom".to_string());
+                }
+            } else {
+                let mut provider = Provider::with_id(
+                    "default".to_string(),
+                    "default".to_string(),
+                    live_settings,
+                    None,
+                );
+                provider.category = Some("custom".to_string());
+                manager.providers.insert(provider.id.clone(), provider);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn sync_current_provider_from_live(
+        state: &AppState,
+        app_type: AppType,
+        live_settings: Value,
+    ) -> Result<(), AppError> {
+        state.update_config(|config| {
+            let manager = config
+                .get_manager_mut(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+            let current_id = manager.current.clone();
+            if current_id.is_empty() {
+                return Ok(());
+            }
+
+            if let Some(existing) = manager.providers.get_mut(&current_id) {
+                existing.settings_config = live_settings;
+                if existing.category.is_none() {
+                    existing.category = Some("custom".to_string());
+                }
+            } else {
+                let mut provider =
+                    Provider::with_id(current_id.clone(), current_id, live_settings, None);
+                provider.category = Some("custom".to_string());
+                manager.providers.insert(provider.id.clone(), provider);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn sync_current_opencode_provider_from_live(
+        state: &AppState,
+        live_settings: Value,
+    ) -> Result<(), AppError> {
+        let fragment = {
+            let config = state.load_config()?;
+            let manager = config
+                .get_manager(&AppType::Opencode)
+                .ok_or_else(|| Self::app_not_found(&AppType::Opencode))?;
+            if manager.current.is_empty() {
+                return Ok(());
+            }
+
+            live_settings
+                .get("provider")
+                .and_then(|value| value.get(&manager.current))
+                .cloned()
+        };
+
+        let Some(fragment) = fragment else {
+            return Ok(());
+        };
+
+        Self::sync_current_provider_from_live(state, AppType::Opencode, fragment)
+    }
+
+    /// 同步 Hermes live 配置（additive 模式）到配置存储快照。
+    ///
+    /// 将整个 ~/.hermes/config.yaml 转成的 JSON 作为默认供应商快照保存，
+    /// 用于界面展示与后续切换回填。供应商级细节由 get_provider 单独读取。
+    fn sync_hermes_provider_from_live(state: &AppState, live_settings: Value) -> Result<(), AppError> {
+        state.update_config(|config| {
+            let manager = config
+                .get_manager_mut(&AppType::Hermes)
+                .ok_or_else(|| Self::app_not_found(&AppType::Hermes))?;
+
+            let current_id = manager.current.clone();
+            let target_id = if current_id.is_empty() {
+                "default".to_string()
+            } else {
+                current_id
+            };
+
+            if let Some(existing) = manager.providers.get_mut(&target_id) {
+                existing.settings_config = live_settings.clone();
+                if existing.category.is_none() {
+                    existing.category = Some("custom".to_string());
+                }
+            } else {
+                let mut provider =
+                    Provider::with_id(target_id.clone(), target_id, live_settings, None);
+                provider.category = Some("custom".to_string());
+                manager.providers.insert(provider.id.clone(), provider);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// 读取当前 live 配置
+    pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
+        match app_type {
+            AppType::Codex => {
+                let auth_path = get_codex_auth_path()?;
+                if !auth_path.exists() {
+                    return Err(AppError::localized(
+                        "codex.auth.missing",
+                        "Codex 配置文件不存在：缺少 auth.json",
+                        "Codex configuration missing: auth.json not found",
+                    ));
+                }
+                let auth: Value = read_json_file(&auth_path)?;
+                let cfg_text = crate::codex_config::read_and_validate_codex_config_text()?;
+                Ok(json!({ "auth": auth, "config": cfg_text }))
+            }
+            AppType::Claude => {
+                let path = get_claude_settings_path()?;
+                if !path.exists() {
+                    return Err(AppError::localized(
+                        "claude.live.missing",
+                        "Claude Code 配置文件不存在",
+                        "Claude settings file is missing",
+                    ));
+                }
+                read_json_file(&path)
+            }
+            AppType::Gemini => {
+                use crate::gemini_config::{
+                    env_to_json, get_gemini_env_path, get_gemini_settings_path, read_gemini_env,
+                };
+
+                // 读取 .env 文件（环境变量）；缺失时返回空配置，避免 400
+                let env_path = get_gemini_env_path()?;
+                if !env_path.exists() {
+                    log::warn!("Gemini .env file not found when reading live settings; returning empty env");
+                }
+                let env_map = read_gemini_env()?;
+                let env_json = env_to_json(&env_map);
+                let env_obj = env_json.get("env").cloned().unwrap_or_else(|| json!({}));
+
+                // 读取 settings.json 文件（MCP 配置等）
+                let settings_path = get_gemini_settings_path()?;
+                let config_obj = if settings_path.exists() {
+                    read_json_file(&settings_path)?
+                } else {
+                    json!({})
+                };
+
+                // 返回完整结构：{ "env": {...}, "config": {...} }
+                Ok(json!({
+                    "env": env_obj,
+                    "config": config_obj
+                }))
+            }
+            AppType::Opencode => {
+                let path = crate::opencode_config::get_opencode_config_path();
+                if !path.exists() {
+                    log::warn!("OpenCode config file not found when reading live settings; returning empty config");
+                    return Ok(json!({
+                        "$schema": "https://opencode.ai/config.json"
+                    }));
+                }
+                crate::opencode_config::read_opencode_config()
+            }
+            AppType::OpenClaw => {
+                let path = crate::openclaw_config::get_openclaw_config_path();
+                if !path.exists() {
+                    return Err(AppError::localized(
+                        "openclaw.live.missing",
+                        "OpenClaw 配置文件不存在",
+                        "OpenClaw configuration file is missing",
+                    ));
+                }
+                crate::openclaw_config::read_openclaw_config()
+            }
+            AppType::ClaudeDesktop => Err(Self::app_not_supported(&app_type)),
+            AppType::GrokBuild => {
+                let path = crate::grok_config::get_grok_config_path();
+                if !path.exists() {
+                    return Err(AppError::localized(
+                        "grokbuild.live.missing",
+                        "Grok Build 配置文件不存在",
+                        "Grok Build configuration file is missing",
+                    ));
+                }
+                crate::grok_config::read_grok_live_settings()
+            }
+            AppType::Hermes => {
+                let path = crate::hermes_config::get_hermes_config_path();
+                if !path.exists() {
+                    return Err(AppError::localized(
+                        "hermes.live.missing",
+                        "Hermes 配置文件不存在",
+                        "Hermes configuration file is missing",
+                    ));
+                }
+                let yaml = crate::hermes_config::read_hermes_config()?;
+                crate::hermes_config::yaml_to_json(&yaml)
+            }
+        }
+    }
+
+    /// 获取自定义端点列表
+    pub fn get_custom_endpoints(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+    ) -> Result<Vec<CustomEndpoint>, AppError> {
+        let cfg = state.load_config()?;
+        let manager = cfg
+            .get_manager(&app_type)
+            .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+        let Some(provider) = manager.providers.get(provider_id) else {
+            return Ok(vec![]);
+        };
+        let Some(meta) = provider.meta.as_ref() else {
+            return Ok(vec![]);
+        };
+        if meta.custom_endpoints.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut result: Vec<_> = meta.custom_endpoints.values().cloned().collect();
+        result.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.added_at));
+        Ok(result)
+    }
+
+    /// 新增自定义端点
+    pub fn add_custom_endpoint(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+        url: String,
+    ) -> Result<(), AppError> {
+        let normalized = url.trim().trim_end_matches('/').to_string();
+        if normalized.is_empty() {
+            return Err(AppError::localized(
+                "provider.endpoint.url_required",
+                "URL 不能为空",
+                "URL cannot be empty",
+            ));
+        }
+
+        state.update_config(|cfg| {
+            let manager = cfg
+                .get_manager_mut(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+            let provider = manager.providers.get_mut(provider_id).ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+            let meta = provider.meta.get_or_insert_with(ProviderMeta::default);
+
+            let endpoint = CustomEndpoint {
+                url: normalized.clone(),
+                added_at: Self::now_millis(),
+                last_used: None,
+            };
+            meta.custom_endpoints.insert(normalized, endpoint);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// 删除自定义端点
+    pub fn remove_custom_endpoint(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+        url: String,
+    ) -> Result<(), AppError> {
+        let normalized = url.trim().trim_end_matches('/').to_string();
+
+        state.update_config(|cfg| {
+            if let Some(manager) = cfg.get_manager_mut(&app_type) {
+                if let Some(provider) = manager.providers.get_mut(provider_id) {
+                    if let Some(meta) = provider.meta.as_mut() {
+                        meta.custom_endpoints.remove(&normalized);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// 更新端点最后使用时间
+    pub fn update_endpoint_last_used(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+        url: String,
+    ) -> Result<(), AppError> {
+        let normalized = url.trim().trim_end_matches('/').to_string();
+
+        state.update_config(|cfg| {
+            if let Some(manager) = cfg.get_manager_mut(&app_type) {
+                if let Some(provider) = manager.providers.get_mut(provider_id) {
+                    if let Some(meta) = provider.meta.as_mut() {
+                        if let Some(endpoint) = meta.custom_endpoints.get_mut(&normalized) {
+                            endpoint.last_used = Some(Self::now_millis());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// 更新供应商排序
+    pub fn update_sort_order(
+        state: &AppState,
+        app_type: AppType,
+        updates: Vec<ProviderSortUpdate>,
+    ) -> Result<bool, AppError> {
+        state.update_config(|cfg| {
+            let manager = cfg
+                .get_manager_mut(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+            for update in updates {
+                if let Some(provider) = manager.providers.get_mut(&update.id) {
+                    provider.sort_index = Some(update.sort_index);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// 执行用量脚本并格式化结果（私有辅助方法）
+    async fn execute_and_format_usage_result(
+        script_code: &str,
+        api_key: &str,
+        base_url: &str,
+        timeout: u64,
+        access_token: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Result<UsageResult, AppError> {
+        match usage_script::execute_usage_script(
+            script_code,
+            api_key,
+            base_url,
+            timeout,
+            access_token,
+            user_id,
+        )
+        .await
+        {
+            Ok(data) => {
+                let usage_list: Vec<UsageData> = if data.is_array() {
+                    serde_json::from_value(data).map_err(|e| {
+                        AppError::localized(
+                            "usage_script.data_format_error",
+                            format!("数据格式错误: {e}"),
+                            format!("Data format error: {e}"),
+                        )
+                    })?
+                } else {
+                    let single: UsageData = serde_json::from_value(data).map_err(|e| {
+                        AppError::localized(
+                            "usage_script.data_format_error",
+                            format!("数据格式错误: {e}"),
+                            format!("Data format error: {e}"),
+                        )
+                    })?;
+                    vec![single]
+                };
+
+                Ok(UsageResult {
+                    success: true,
+                    data: Some(usage_list),
+                    error: None,
+                })
+            }
+            Err(err) => {
+                let lang = settings::get_settings()
+                    .language
+                    .unwrap_or_else(|| "zh".to_string());
+
+                let msg = match err {
+                    AppError::Localized { zh, en, .. } => {
+                        if lang == "en" {
+                            en
+                        } else {
+                            zh
+                        }
+                    }
+                    other => other.to_string(),
+                };
+
+                Ok(UsageResult {
+                    success: false,
+                    data: None,
+                    error: Some(msg),
+                })
+            }
+        }
+    }
+
+    /// 查询供应商用量（使用已保存的脚本配置）
+    pub async fn query_usage(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+    ) -> Result<UsageResult, AppError> {
+        let (script_code, timeout, api_key, base_url, access_token, user_id, template_type) = {
+            let config = state.load_config()?;
+            let manager = config
+                .get_manager(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+            let provider = manager.providers.get(provider_id).cloned().ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+            let usage_script = provider
+                .meta
+                .as_ref()
+                .and_then(|m| m.usage_script.as_ref())
+                .ok_or_else(|| {
+                    AppError::localized(
+                        "provider.usage.script.missing",
+                        "未配置用量查询脚本",
+                        "Usage script is not configured",
+                    )
+                })?;
+            if !usage_script.enabled {
+                return Err(AppError::localized(
+                    "provider.usage.disabled",
+                    "用量查询未启用",
+                    "Usage query is disabled",
+                ));
+            }
+
+            let env = provider.settings_config.get("env");
+            let provider_api_key = env
+                .and_then(|env| {
+                    [
+                        "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_API_KEY",
+                        "OPENAI_API_KEY",
+                        "CODEX_API_KEY",
+                        "OPENROUTER_API_KEY",
+                        "GOOGLE_API_KEY",
+                        "GEMINI_API_KEY",
+                    ]
+                    .iter()
+                    .find_map(|key| env.get(*key).and_then(serde_json::Value::as_str))
+                })
+                .unwrap_or_default();
+            let provider_base_url = env
+                .and_then(|env| {
+                    [
+                        "ANTHROPIC_BASE_URL",
+                        "OPENAI_BASE_URL",
+                        "CODEX_BASE_URL",
+                        "OPENROUTER_BASE_URL",
+                        "GOOGLE_GEMINI_BASE_URL",
+                        "GEMINI_API_BASE_URL",
+                    ]
+                    .iter()
+                    .find_map(|key| env.get(*key).and_then(serde_json::Value::as_str))
+                })
+                .unwrap_or_default();
+            (
+                usage_script.code.clone(),
+                usage_script.timeout.unwrap_or(10),
+                usage_script
+                    .api_key
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| provider_api_key.to_string()),
+                usage_script
+                    .base_url
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| provider_base_url.trim_end_matches('/').to_string()),
+                usage_script.access_token.clone(),
+                usage_script.user_id.clone(),
+                usage_script.template_type.clone(),
+            )
+        };
+
+        match template_type.as_deref() {
+            Some("token_plan") => {
+                return Ok(crate::services::coding_plan::get_coding_plan_quota(
+                    &base_url, &api_key,
+                )
+                .await);
+            }
+            Some("balance") => {
+                return Ok(crate::services::balance::get_balance(&base_url, &api_key).await);
+            }
+            _ => {}
+        }
+
+        Self::execute_and_format_usage_result(
+            &script_code,
+            &api_key,
+            &base_url,
+            timeout,
+            access_token.as_deref(),
+            user_id.as_deref(),
+        )
+        .await
+    }
+
+    /// 测试用量脚本（使用临时脚本内容，不保存）
+    #[allow(clippy::too_many_arguments)]
+    pub async fn test_usage_script(
+        state: &AppState,
+        app_type: AppType,
+        provider_id: &str,
+        script_code: &str,
+        timeout: u64,
+        api_key: Option<&str>,
+        base_url: Option<&str>,
+        access_token: Option<&str>,
+        user_id: Option<&str>,
+        template_type: Option<&str>,
+    ) -> Result<UsageResult, AppError> {
+        if matches!(template_type, Some("token_plan" | "balance")) {
+            let config = state.load_config()?;
+            let provider = config
+                .get_manager(&app_type)
+                .and_then(|manager| manager.providers.get(provider_id));
+            let env = provider.and_then(|provider| provider.settings_config.get("env"));
+            let fallback_key = env
+                .and_then(|env| {
+                    [
+                        "ANTHROPIC_AUTH_TOKEN",
+                        "ANTHROPIC_API_KEY",
+                        "OPENAI_API_KEY",
+                        "OPENROUTER_API_KEY",
+                        "GOOGLE_API_KEY",
+                    ]
+                    .iter()
+                    .find_map(|key| env.get(*key).and_then(serde_json::Value::as_str))
+                })
+                .unwrap_or_default();
+            let fallback_url = env
+                .and_then(|env| {
+                    [
+                        "ANTHROPIC_BASE_URL",
+                        "OPENAI_BASE_URL",
+                        "OPENROUTER_BASE_URL",
+                        "GOOGLE_GEMINI_BASE_URL",
+                    ]
+                    .iter()
+                    .find_map(|key| env.get(*key).and_then(serde_json::Value::as_str))
+                })
+                .unwrap_or_default();
+            let key = api_key
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(fallback_key);
+            let url = base_url
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(fallback_url);
+            return Ok(match template_type {
+                Some("token_plan") => {
+                    crate::services::coding_plan::get_coding_plan_quota(url, key).await
+                }
+                _ => crate::services::balance::get_balance(url, key).await,
+            });
+        }
+        // 直接使用传入的凭证参数进行测试
+        Self::execute_and_format_usage_result(
+            script_code,
+            api_key.unwrap_or(""),
+            base_url.unwrap_or(""),
+            timeout,
+            access_token,
+            user_id,
+        )
+        .await
+    }
+
+    /// 切换指定应用的供应商
+    pub fn switch(state: &AppState, app_type: AppType, provider_id: &str) -> Result<(), AppError> {
+        let app_type_clone = app_type.clone();
+        let provider_id_owned = provider_id.to_string();
+
+        Self::run_transaction(state, move |config| {
+            let backup = Self::capture_live_snapshot(&app_type_clone)?;
+            let mut provider = match app_type_clone {
+                AppType::Codex => Self::prepare_switch_codex(config, &provider_id_owned)?,
+                AppType::Claude => Self::prepare_switch_claude(config, &provider_id_owned)?,
+                AppType::Gemini => Self::prepare_switch_gemini(config, &provider_id_owned)?,
+                AppType::ClaudeDesktop => {
+                    Self::prepare_switch_claude_desktop(config, &provider_id_owned)?
+                }
+                AppType::Opencode => Self::prepare_switch_opencode(config, &provider_id_owned)?,
+                AppType::OpenClaw => Self::prepare_switch_openclaw(config, &provider_id_owned)?,
+                AppType::GrokBuild => {
+                    Self::prepare_switch_grokbuild(config, &app_type_clone, &provider_id_owned)?
+                }
+                AppType::Hermes => {
+                    Self::prepare_switch_hermes(config, &app_type_clone, &provider_id_owned)?
+                }
+            };
+
+            // 多 KEY 均衡使用：切换时 round-robin 轮询下一个 KEY 并写回配置
+            Self::rotate_api_key_for_switch(
+                config,
+                &app_type_clone,
+                &provider_id_owned,
+                &mut provider,
+            );
+
+            let action = PostCommitAction {
+                app_type: app_type_clone.clone(),
+                provider,
+                backup,
+                sync_mcp: !matches!(app_type_clone, AppType::ClaudeDesktop | AppType::OpenClaw),
+                refresh_snapshot: !matches!(app_type_clone, AppType::ClaudeDesktop),
+                set_additive_default: matches!(
+                    app_type_clone,
+                    AppType::OpenClaw | AppType::Hermes
+                ),
+            };
+
+            Ok(((), Some(action)))
+        })
+    }
+
+    /// 多 KEY 均衡：按 meta.apiKeys + apiKeyIndex 轮询选择下一个 KEY。
+    /// 找到 settings_config 中已存在的 KEY 字段并替换；替换成功后推进索引并持久化。
+    /// 返回是否发生了轮询替换。
+    fn rotate_api_key_for_switch(
+        config: &mut MultiAppConfig,
+        app_type: &AppType,
+        provider_id: &str,
+        provider: &mut Provider,
+    ) -> bool {
+        let Some(meta) = provider.meta.as_mut() else {
+            return false;
+        };
+        let keys = &meta.api_keys;
+        if keys.len() < 2 {
+            return false;
+        }
+        let cur = meta.api_key_index.unwrap_or(0) % keys.len();
+        let next_idx = (cur + 1) % keys.len();
+        let next_key = keys[next_idx].clone();
+
+        if !Self::replace_api_key_in_settings(&mut provider.settings_config, &next_key) {
+            return false;
+        }
+
+        meta.api_key_index = Some(next_idx);
+
+        // 持久化轮询后的 settings_config 与索引到配置存储
+        if let Some(manager) = config.get_manager_mut(app_type) {
+            if let Some(target) = manager.providers.get_mut(provider_id) {
+                target.settings_config = provider.settings_config.clone();
+                target.meta = provider.meta.clone();
+            }
+        }
+
+        true
+    }
+
+    /// 在 settings_config 中查找并替换首个已存在的 API KEY 字段。
+    /// 支持字段：ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / GEMINI_API_KEY /
+    /// OPENAI_API_KEY / apiKey（覆盖 Claude / Codex / Gemini / OpenCode / OpenClaw）。
+    fn replace_api_key_in_settings(settings: &mut Value, key: &str) -> bool {
+        const KEY_FIELDS: &[&str] = &[
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "apiKey",
+        ];
+        match settings {
+            Value::Object(map) => {
+                for field in KEY_FIELDS {
+                    if let Some(v) = map.get_mut(*field) {
+                        if v.is_string() {
+                            *v = Value::String(key.to_string());
+                            return true;
+                        }
+                    }
+                }
+                for (_, value) in map.iter_mut() {
+                    if Self::replace_api_key_in_settings(value, key) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    if Self::replace_api_key_in_settings(item, key) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn prepare_switch_codex(
+        config: &mut MultiAppConfig,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(&AppType::Codex)
+            .ok_or_else(|| Self::app_not_found(&AppType::Codex))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        Self::backfill_codex_current(config, provider_id)?;
+
+        if let Some(manager) = config.get_manager_mut(&AppType::Codex) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn backfill_codex_current(
+        config: &mut MultiAppConfig,
+        next_provider: &str,
+    ) -> Result<(), AppError> {
+        if Self::proxy_takeover_enabled(&AppType::Codex) {
+            return Ok(());
+        }
+
+        let current_id = config
+            .get_manager(&AppType::Codex)
+            .map(|m| m.current.clone())
+            .unwrap_or_default();
+
+        if current_id.is_empty() || current_id == next_provider {
+            return Ok(());
+        }
+
+        let auth_path = get_codex_auth_path()?;
+        if !auth_path.exists() {
+            return Ok(());
+        }
+
+        let auth: Value = read_json_file(&auth_path)?;
+        let config_path = get_codex_config_path()?;
+        let config_text = if config_path.exists() {
+            std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?
+        } else {
+            String::new()
+        };
+
+        let live = json!({
+            "auth": auth,
+            "config": config_text,
+        });
+
+        if let Some(manager) = config.get_manager_mut(&AppType::Codex) {
+            if let Some(current) = manager.providers.get_mut(&current_id) {
+                current.settings_config = live;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_codex_live(provider: &Provider) -> Result<(), AppError> {
+        if Self::is_managed_oauth_provider(provider) {
+            return Err(AppError::localized(
+                "provider.codex.oauth_requires_proxy",
+                "Codex OAuth 托管供应商需要开启 Codex 代理接管后使用。",
+                "Codex OAuth managed providers require Codex proxy takeover.",
+            ));
+        }
+        let settings = provider
+            .settings_config
+            .as_object()
+            .ok_or_else(|| AppError::Config("Codex 配置必须是 JSON 对象".into()))?;
+        let auth = settings
+            .get("auth")
+            .ok_or_else(|| AppError::Config(format!("供应商 {} 缺少 auth 配置", provider.id)))?;
+        if !auth.is_object() {
+            return Err(AppError::Config(format!(
+                "供应商 {} 的 auth 必须是对象",
+                provider.id
+            )));
+        }
+        let cfg_text = settings.get("config").and_then(Value::as_str);
+
+        write_codex_live_atomic(auth, cfg_text)?;
+        Ok(())
+    }
+
+    fn prepare_switch_claude(
+        config: &mut MultiAppConfig,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(&AppType::Claude)
+            .ok_or_else(|| Self::app_not_found(&AppType::Claude))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        Self::backfill_claude_current(config, provider_id)?;
+
+        if let Some(manager) = config.get_manager_mut(&AppType::Claude) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn prepare_switch_claude_desktop(
+        config: &mut MultiAppConfig,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let app_type = AppType::ClaudeDesktop;
+        let provider = config
+            .get_manager(&app_type)
+            .ok_or_else(|| Self::app_not_found(&app_type))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        if let Some(manager) = config.get_manager_mut(&app_type) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn prepare_switch_gemini(
+        config: &mut MultiAppConfig,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(&AppType::Gemini)
+            .ok_or_else(|| Self::app_not_found(&AppType::Gemini))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        Self::backfill_gemini_current(config, provider_id)?;
+
+        if let Some(manager) = config.get_manager_mut(&AppType::Gemini) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn prepare_switch_opencode(
+        config: &mut MultiAppConfig,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(&AppType::Opencode)
+            .ok_or_else(|| Self::app_not_found(&AppType::Opencode))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        Self::backfill_opencode_current(config, provider_id)?;
+
+        if let Some(manager) = config.get_manager_mut(&AppType::Opencode) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn prepare_switch_openclaw(
+        config: &mut MultiAppConfig,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(&AppType::OpenClaw)
+            .ok_or_else(|| Self::app_not_found(&AppType::OpenClaw))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        if let Some(manager) = config.get_manager_mut(&AppType::OpenClaw) {
+            manager.current = provider_id.to_string();
+        }
+        Ok(provider)
+    }
+
+    fn prepare_switch_grokbuild(
+        config: &mut MultiAppConfig,
+        app_type: &AppType,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(app_type)
+            .ok_or_else(|| Self::app_not_found(app_type))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        Self::backfill_grokbuild_current(config, app_type, provider_id)?;
+
+        if let Some(manager) = config.get_manager_mut(app_type) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn prepare_switch_hermes(
+        config: &mut MultiAppConfig,
+        app_type: &AppType,
+        provider_id: &str,
+    ) -> Result<Provider, AppError> {
+        let provider = config
+            .get_manager(app_type)
+            .ok_or_else(|| Self::app_not_found(app_type))?
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?;
+
+        Self::backfill_hermes_current(config, app_type, provider_id)?;
+
+        if let Some(manager) = config.get_manager_mut(app_type) {
+            manager.current = provider_id.to_string();
+        }
+
+        Ok(provider)
+    }
+
+    fn backfill_claude_current(
+        config: &mut MultiAppConfig,
+        next_provider: &str,
+    ) -> Result<(), AppError> {
+        if Self::proxy_takeover_enabled(&AppType::Claude) {
+            return Ok(());
+        }
+
+        let settings_path = get_claude_settings_path()?;
+        if !settings_path.exists() {
+            return Ok(());
+        }
+
+        let current_id = config
+            .get_manager(&AppType::Claude)
+            .map(|m| m.current.clone())
+            .unwrap_or_default();
+        if current_id.is_empty() || current_id == next_provider {
+            return Ok(());
+        }
+
+        let mut live = read_json_file::<Value>(&settings_path)?;
+        let _ = Self::normalize_claude_models_in_value(&mut live);
+        if let Some(manager) = config.get_manager_mut(&AppType::Claude) {
+            if let Some(current) = manager.providers.get_mut(&current_id) {
+                current.settings_config = live;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn backfill_gemini_current(
+        config: &mut MultiAppConfig,
+        next_provider: &str,
+    ) -> Result<(), AppError> {
+        if Self::proxy_takeover_enabled(&AppType::Gemini) {
+            return Ok(());
+        }
+
+        use crate::gemini_config::{
+            env_to_json, get_gemini_env_path, get_gemini_settings_path, read_gemini_env,
+        };
+
+        let env_path = get_gemini_env_path()?;
+        if !env_path.exists() {
+            return Ok(());
+        }
+
+        let current_id = config
+            .get_manager(&AppType::Gemini)
+            .map(|m| m.current.clone())
+            .unwrap_or_default();
+        if current_id.is_empty() || current_id == next_provider {
+            return Ok(());
+        }
+
+        let env_map = read_gemini_env()?;
+        let mut live = env_to_json(&env_map);
+
+        let settings_path = get_gemini_settings_path()?;
+        let config_value = if settings_path.exists() {
+            read_json_file(&settings_path)?
+        } else {
+            json!({})
+        };
+        if let Some(obj) = live.as_object_mut() {
+            obj.insert("config".to_string(), config_value);
+        }
+
+        if let Some(manager) = config.get_manager_mut(&AppType::Gemini) {
+            if let Some(current) = manager.providers.get_mut(&current_id) {
+                current.settings_config = live;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn backfill_opencode_current(
+        config: &mut MultiAppConfig,
+        next_provider: &str,
+    ) -> Result<(), AppError> {
+        if Self::proxy_takeover_enabled(&AppType::Opencode) {
+            return Ok(());
+        }
+
+        let current_id = config
+            .get_manager(&AppType::Opencode)
+            .map(|manager| manager.current.clone())
+            .unwrap_or_default();
+        if current_id.is_empty() || current_id == next_provider {
+            return Ok(());
+        }
+
+        let live_config = crate::opencode_config::read_opencode_config()?;
+        let current_settings = live_config
+            .get("provider")
+            .and_then(|value| value.get(&current_id))
+            .cloned();
+
+        if let Some(settings) = current_settings {
+            if let Some(manager) = config.get_manager_mut(&AppType::Opencode) {
+                if let Some(current) = manager.providers.get_mut(&current_id) {
+                    current.settings_config = settings;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn backfill_grokbuild_current(
+        config: &mut MultiAppConfig,
+        app_type: &AppType,
+        next_provider: &str,
+    ) -> Result<(), AppError> {
+        let current_id = config
+            .get_manager(app_type)
+            .map(|manager| manager.current.clone())
+            .unwrap_or_default();
+        if current_id.is_empty() || current_id == next_provider {
+            return Ok(());
+        }
+
+        let path = crate::grok_config::get_grok_config_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let live_config = crate::grok_config::read_grok_live_settings()?;
+        if let Some(manager) = config.get_manager_mut(app_type) {
+            if let Some(current) = manager.providers.get_mut(&current_id) {
+                current.settings_config = live_config;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn backfill_hermes_current(
+        config: &mut MultiAppConfig,
+        app_type: &AppType,
+        next_provider: &str,
+    ) -> Result<(), AppError> {
+        let current_id = config
+            .get_manager(app_type)
+            .map(|manager| manager.current.clone())
+            .unwrap_or_default();
+        if current_id.is_empty() || current_id == next_provider {
+            return Ok(());
+        }
+
+        let path = crate::hermes_config::get_hermes_config_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        if let Some(manager) = config.get_manager_mut(app_type) {
+            if let Some(current) = manager.providers.get_mut(&current_id) {
+                if let Some(live_fragment) = crate::hermes_config::get_provider(&current_id)? {
+                    current.settings_config = live_fragment;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_claude_live(provider: &Provider) -> Result<(), AppError> {
+        if Self::is_managed_oauth_provider(provider) {
+            return Err(AppError::localized(
+                "provider.claude.oauth_requires_proxy",
+                "GitHub Copilot / Codex OAuth 托管供应商需要开启 Claude 代理接管后使用。",
+                "GitHub Copilot / Codex OAuth managed providers require Claude proxy takeover.",
+            ));
+        }
+        let settings_path = get_claude_settings_path()?;
+        let mut content = provider.settings_config.clone();
+        let _ = Self::normalize_claude_models_in_value(&mut content);
+        write_json_file(&settings_path, &content)?;
+        Ok(())
+    }
+
+    fn is_managed_oauth_provider(provider: &Provider) -> bool {
+        let Some(meta) = provider.meta.as_ref() else {
+            return false;
+        };
+        if meta
+            .auth_binding
+            .as_ref()
+            .is_some_and(|binding| auth_binding_mode_is(&binding.mode, "api_key"))
+        {
+            return false;
+        }
+        if meta.auth_binding.is_none()
+            && meta
+                .github_account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            && provider_has_manual_auth_key(provider)
+        {
+            return false;
+        }
+        meta.provider_type().is_some_and(|provider_type| {
+            matches!(
+                provider_type,
+                ProviderType::GithubCopilot | ProviderType::CodexOauth
+            )
+        })
+    }
+
+    pub(crate) fn write_gemini_live(provider: &Provider) -> Result<(), AppError> {
+        use crate::gemini_config::{
+            get_gemini_settings_path, json_to_env, validate_gemini_settings_strict,
+            write_gemini_env_atomic,
+        };
+
+        // 一次性检测认证类型，避免重复检测
+        let auth_type = Self::detect_gemini_auth_type(provider);
+
+        let mut env_map = json_to_env(&provider.settings_config)?;
+
+        // 准备要写入 ~/.gemini/settings.json 的配置（缺省时保留现有文件内容）
+        let mut config_to_write = if let Some(config_value) = provider.settings_config.get("config")
+        {
+            if config_value.is_null() {
+                Some(json!({}))
+            } else if config_value.is_object() {
+                Some(config_value.clone())
+            } else {
+                return Err(AppError::localized(
+                    "gemini.validation.invalid_config",
+                    "Gemini 配置格式错误: config 必须是对象或 null",
+                    "Gemini config invalid: config must be an object or null",
+                ));
+            }
+        } else {
+            None
+        };
+
+        if config_to_write.is_none() {
+            let settings_path = get_gemini_settings_path()?;
+            if settings_path.exists() {
+                config_to_write = Some(read_json_file(&settings_path)?);
+            }
+        }
+
+        match auth_type {
+            GeminiAuthType::GoogleOfficial => {
+                // Google 官方使用 OAuth，清空 env
+                env_map.clear();
+                write_gemini_env_atomic(&env_map)?;
+            }
+            GeminiAuthType::Packycode => {
+                // PackyCode 供应商，使用 API Key（切换时严格验证）
+                validate_gemini_settings_strict(&provider.settings_config)?;
+                write_gemini_env_atomic(&env_map)?;
+            }
+            GeminiAuthType::Generic => {
+                // 通用供应商，使用 API Key（切换时严格验证）
+                validate_gemini_settings_strict(&provider.settings_config)?;
+                write_gemini_env_atomic(&env_map)?;
+            }
+        }
+
+        if let Some(config_value) = config_to_write {
+            let settings_path = get_gemini_settings_path()?;
+            write_json_file(&settings_path, &config_value)?;
+        }
+
+        match auth_type {
+            GeminiAuthType::GoogleOfficial => Self::ensure_google_oauth_security_flag(provider)?,
+            GeminiAuthType::Packycode => Self::ensure_packycode_security_flag(provider)?,
+            GeminiAuthType::Generic => {
+                settings::ensure_security_auth_selected_type(
+                    Self::PACKYCODE_SECURITY_SELECTED_TYPE,
+                )?;
+                use crate::gemini_config::write_api_key_settings;
+                write_api_key_settings()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn write_opencode_live(provider: &Provider) -> Result<(), AppError> {
+        let settings = provider.settings_config.as_object().ok_or_else(|| {
+            AppError::localized(
+                "provider.opencode.settings.not_object",
+                "OpenCode 配置必须是 JSON 对象",
+                "OpenCode configuration must be a JSON object",
+            )
+        })?;
+
+        let fragment =
+            if let Some(providers) = settings.get("provider").and_then(|value| value.as_object()) {
+                providers.get(&provider.id).cloned().ok_or_else(|| {
+                    AppError::localized(
+                        "provider.opencode.fragment.missing",
+                        format!("OpenCode 配置缺少 provider.{}", provider.id),
+                        format!("OpenCode configuration is missing provider.{}", provider.id),
+                    )
+                })?
+            } else if settings.contains_key("$schema") {
+                return Err(AppError::localized(
+                    "provider.opencode.fragment.missing",
+                    format!("OpenCode 配置缺少 provider.{}", provider.id),
+                    format!("OpenCode configuration is missing provider.{}", provider.id),
+                ));
+            } else {
+                provider.settings_config.clone()
+            };
+
+        if !fragment.is_object() {
+            return Err(AppError::localized(
+                "provider.opencode.fragment.not_object",
+                format!("OpenCode provider.{} 必须是 JSON 对象", provider.id),
+                format!("OpenCode provider.{} must be a JSON object", provider.id),
+            ));
+        }
+
+        crate::opencode_config::set_provider(&provider.id, fragment)?;
+        Ok(())
+    }
+
+    fn openclaw_fragment(provider: &Provider) -> Result<Value, AppError> {
+        let settings = provider.settings_config.as_object().ok_or_else(|| {
+            AppError::localized(
+                "provider.openclaw.settings.not_object",
+                "OpenClaw 配置必须是 JSON 对象",
+                "OpenClaw configuration must be a JSON object",
+            )
+        })?;
+        if let Some(providers) = settings.get("providers").and_then(Value::as_object) {
+            if let Some(fragment) = providers.get(&provider.id) {
+                return Ok(fragment.clone());
+            }
+        }
+        if let Some(models) = settings.get("models").and_then(Value::as_object) {
+            if let Some(fragment) = models
+                .get("providers")
+                .and_then(Value::as_object)
+                .and_then(|providers| providers.get(&provider.id))
+            {
+                return Ok(fragment.clone());
+            }
+        }
+        Ok(provider.settings_config.clone())
+    }
+
+    fn write_openclaw_live(provider: &Provider) -> Result<(), AppError> {
+        let fragment = Self::openclaw_fragment(provider)?;
+        if !fragment.is_object() {
+            return Err(AppError::localized(
+                "provider.openclaw.fragment.not_object",
+                format!("OpenClaw provider {} 必须是 JSON 对象", provider.id),
+                format!("OpenClaw provider {} must be a JSON object", provider.id),
+            ));
+        }
+        crate::openclaw_config::set_provider(&provider.id, fragment)?;
+        Ok(())
+    }
+
+    fn set_openclaw_default(provider: &Provider) -> Result<(), AppError> {
+        let primary = Self::openclaw_primary_model(provider);
+        if let Some(primary) = primary {
+            crate::openclaw_config::set_default_model(
+                &crate::openclaw_config::OpenClawDefaultModel {
+                    primary,
+                    fallbacks: Vec::new(),
+                    extra: HashMap::new(),
+                },
+            )?;
+            return Ok(());
+        }
+        Err(AppError::localized(
+            "provider.openclaw.default_model.missing",
+            format!("OpenClaw 供应商 {} 没有可用的默认模型", provider.id),
+            format!("OpenClaw provider {} has no model to select", provider.id),
+        ))
+    }
+
+    pub(crate) fn write_grok_live(provider: &Provider) -> Result<(), AppError> {
+        crate::grok_config::write_grok_provider_live(provider)
+    }
+
+    pub(crate) fn write_hermes_live(provider: &Provider) -> Result<(), AppError> {
+        if !provider.settings_config.is_object() {
+            return Err(AppError::localized(
+                "provider.hermes.settings.not_object",
+                "Hermes 配置必须是 JSON 对象",
+                "Hermes configuration must be a JSON object",
+            ));
+        }
+        crate::hermes_config::set_provider(&provider.id, provider.settings_config.clone())?;
+        Ok(())
+    }
+
+    fn write_live_snapshot(
+        state: &AppState,
+        app_type: &AppType,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
+        match app_type {
+            AppType::Codex => Self::write_codex_live(provider),
+            AppType::Claude => Self::write_claude_live(provider),
+            AppType::Gemini => Self::write_gemini_live(provider), // 新增
+            AppType::ClaudeDesktop => {
+                crate::claude_desktop_config::apply_provider(&state.db, provider)
+            }
+            AppType::Opencode => Self::write_opencode_live(provider),
+            AppType::OpenClaw => Self::write_openclaw_live(provider),
+            AppType::GrokBuild => Self::write_grok_live(provider),
+            AppType::Hermes => Self::write_hermes_live(provider),
+        }
+    }
+
+    fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
+        match app_type {
+            AppType::ClaudeDesktop => {
+                crate::claude_desktop_config::validate_provider(provider)?;
+            }
+            AppType::Claude => {
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.claude.settings.not_object",
+                        "Claude 配置必须是 JSON 对象",
+                        "Claude configuration must be a JSON object",
+                    ));
+                }
+            }
+            AppType::Codex => {
+                let settings = provider.settings_config.as_object().ok_or_else(|| {
+                    AppError::localized(
+                        "provider.codex.settings.not_object",
+                        "Codex 配置必须是 JSON 对象",
+                        "Codex configuration must be a JSON object",
+                    )
+                })?;
+
+                let auth = settings.get("auth").ok_or_else(|| {
+                    AppError::localized(
+                        "provider.codex.auth.missing",
+                        format!("供应商 {} 缺少 auth 配置", provider.id),
+                        format!("Provider {} is missing auth configuration", provider.id),
+                    )
+                })?;
+                if !auth.is_object() {
+                    return Err(AppError::localized(
+                        "provider.codex.auth.not_object",
+                        format!("供应商 {} 的 auth 配置必须是 JSON 对象", provider.id),
+                        format!(
+                            "Provider {} auth configuration must be a JSON object",
+                            provider.id
+                        ),
+                    ));
+                }
+
+                if let Some(config_value) = settings.get("config") {
+                    if !(config_value.is_string() || config_value.is_null()) {
+                        return Err(AppError::localized(
+                            "provider.codex.config.invalid_type",
+                            "Codex config 字段必须是字符串",
+                            "Codex config field must be a string",
+                        ));
+                    }
+                    if let Some(cfg_text) = config_value.as_str() {
+                        crate::codex_config::validate_config_toml(cfg_text)?;
+                    }
+                }
+            }
+            AppType::Gemini => {
+                // 新增
+                use crate::gemini_config::validate_gemini_settings;
+                validate_gemini_settings(&provider.settings_config)?
+            }
+            AppType::Opencode => {
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.opencode.settings.not_object",
+                        "OpenCode 配置必须是 JSON 对象",
+                        "OpenCode configuration must be a JSON object",
+                    ));
+                }
+            }
+            AppType::OpenClaw => {
+                let settings = provider.settings_config.as_object().ok_or_else(|| {
+                    AppError::localized(
+                        "provider.openclaw.settings.not_object",
+                        "OpenClaw 配置必须是 JSON 对象",
+                        "OpenClaw configuration must be a JSON object",
+                    )
+                })?;
+                let models = settings
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.openclaw.models.missing",
+                            "OpenClaw 配置必须包含 models 数组",
+                            "OpenClaw configuration must contain a models array",
+                        )
+                    })?;
+                if models.is_empty()
+                    || models.iter().any(|model| {
+                        model
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map_or(true, |id| id.trim().is_empty())
+                    })
+                {
+                    return Err(AppError::localized(
+                        "provider.openclaw.models.invalid",
+                        "OpenClaw models 必须至少包含一个有效的 id",
+                        "OpenClaw models must contain at least one valid id",
+                    ));
+                }
+                if let Some(base_url) = settings.get("baseUrl").and_then(Value::as_str) {
+                    if !(base_url.is_empty()
+                        || base_url.starts_with("http://")
+                        || base_url.starts_with("https://"))
+                    {
+                        return Err(AppError::localized(
+                            "provider.openclaw.base_url.invalid",
+                            "OpenClaw baseUrl 必须是 HTTP(S) 地址",
+                            "OpenClaw baseUrl must be an HTTP(S) URL",
+                        ));
+                    }
+                }
+            }
+            AppType::GrokBuild => {
+                crate::grok_config::validate_grok_provider_settings(&provider.settings_config)?;
+            }
+            AppType::Hermes => {
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.hermes.settings.not_object",
+                        "Hermes 配置必须是 JSON 对象",
+                        "Hermes configuration must be a JSON object",
+                    ));
+                }
+            }
+        }
+
+        // 🔧 验证并清理 UsageScript 配置（所有应用类型通用）
+        if let Some(meta) = &provider.meta {
+            if let Some(usage_script) = &meta.usage_script {
+                Self::validate_usage_script(usage_script)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 验证 UsageScript 配置（边界检查）
+    fn validate_usage_script(script: &crate::provider::UsageScript) -> Result<(), AppError> {
+        // 验证自动查询间隔 (0-1440 分钟，即最大24小时)
+        if let Some(interval) = script.auto_query_interval {
+            if interval > 1440 {
+                return Err(AppError::localized(
+                    "usage_script.interval_too_large",
+                    format!(
+                        "自动查询间隔不能超过 1440 分钟（24小时），当前值: {interval}"
+                    ),
+                    format!(
+                        "Auto query interval cannot exceed 1440 minutes (24 hours), current: {interval}"
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn extract_credentials(
+        provider: &Provider,
+        app_type: &AppType,
+    ) -> Result<(String, String), AppError> {
+        match app_type {
+            AppType::Claude | AppType::ClaudeDesktop => {
+                let env = provider
+                    .settings_config
+                    .get("env")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.claude.env.missing",
+                            "配置格式错误: 缺少 env",
+                            "Invalid configuration: missing env section",
+                        )
+                    })?;
+
+                let api_key = env
+                    .get("ANTHROPIC_AUTH_TOKEN")
+                    .or_else(|| env.get("ANTHROPIC_API_KEY"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.claude.api_key.missing",
+                            "缺少 API Key",
+                            "API key is missing",
+                        )
+                    })?
+                    .to_string();
+
+                let base_url = env
+                    .get("ANTHROPIC_BASE_URL")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.claude.base_url.missing",
+                            "缺少 ANTHROPIC_BASE_URL 配置",
+                            "Missing ANTHROPIC_BASE_URL configuration",
+                        )
+                    })?
+                    .to_string();
+
+                Ok((api_key, base_url))
+            }
+            AppType::Codex => {
+                let auth = provider
+                    .settings_config
+                    .get("auth")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.codex.auth.missing",
+                            "配置格式错误: 缺少 auth",
+                            "Invalid configuration: missing auth section",
+                        )
+                    })?;
+
+                let api_key = auth
+                    .get("OPENAI_API_KEY")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.codex.api_key.missing",
+                            "缺少 API Key",
+                            "API key is missing",
+                        )
+                    })?
+                    .to_string();
+
+                let config_toml = provider
+                    .settings_config
+                    .get("config")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let base_url = if config_toml.contains("base_url") {
+                    let re = Regex::new(r#"base_url\s*=\s*["']([^"']+)["']"#).map_err(|e| {
+                        AppError::localized(
+                            "provider.regex_init_failed",
+                            format!("正则初始化失败: {e}"),
+                            format!("Failed to initialize regex: {e}"),
+                        )
+                    })?;
+                    re.captures(config_toml)
+                        .and_then(|caps| caps.get(1))
+                        .map(|m| m.as_str().to_string())
+                        .ok_or_else(|| {
+                            AppError::localized(
+                                "provider.codex.base_url.invalid",
+                                "config.toml 中 base_url 格式错误",
+                                "base_url in config.toml has invalid format",
+                            )
+                        })?
+                } else {
+                    return Err(AppError::localized(
+                        "provider.codex.base_url.missing",
+                        "config.toml 中缺少 base_url 配置",
+                        "base_url is missing from config.toml",
+                    ));
+                };
+
+                Ok((api_key, base_url))
+            }
+            AppType::Gemini => {
+                // 新增
+                use crate::gemini_config::json_to_env;
+
+                let env_map = json_to_env(&provider.settings_config)?;
+
+                let api_key = env_map.get("GEMINI_API_KEY").cloned().ok_or_else(|| {
+                    AppError::localized(
+                        "gemini.missing_api_key",
+                        "缺少 GEMINI_API_KEY",
+                        "Missing GEMINI_API_KEY",
+                    )
+                })?;
+
+                let base_url = env_map
+                    .get("GOOGLE_GEMINI_BASE_URL")
+                    .cloned()
+                    .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+
+                Ok((api_key, base_url))
+            }
+            AppType::Opencode => {
+                let settings = provider.settings_config.as_object().ok_or_else(|| {
+                    AppError::localized(
+                        "provider.opencode.settings.not_object",
+                        "OpenCode 配置必须是 JSON 对象",
+                        "OpenCode configuration must be a JSON object",
+                    )
+                })?;
+
+                let options = settings
+                    .get("options")
+                    .and_then(|value| value.as_object())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.opencode.options.missing",
+                            "OpenCode 配置缺少 options 字段",
+                            "OpenCode configuration is missing options",
+                        )
+                    })?;
+
+                let api_key = options
+                    .get("apiKey")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.opencode.api_key.missing",
+                            "缺少 OpenCode API Key",
+                            "OpenCode API key is missing",
+                        )
+                    })?
+                    .to_string();
+
+                let base_url = options
+                    .get("baseURL")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "provider.opencode.base_url.missing",
+                            "缺少 OpenCode baseURL",
+                            "OpenCode baseURL is missing",
+                        )
+                    })?
+                    .to_string();
+
+                Ok((api_key, base_url))
+            }
+            AppType::OpenClaw => {
+                let settings = provider
+                    .settings_config
+                    .as_object()
+                    .ok_or_else(|| Self::app_not_supported(app_type))?;
+                let api_key = settings
+                    .get("apiKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let base_url = settings
+                    .get("baseUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok((api_key, base_url))
+            }
+            AppType::GrokBuild => Err(Self::app_not_supported(app_type)),
+            AppType::Hermes => Err(Self::app_not_supported(app_type)),
+        }
+    }
+
+    fn app_not_found(app_type: &AppType) -> AppError {
+        AppError::localized(
+            "provider.app_not_found",
+            format!("应用类型不存在: {app_type:?}"),
+            format!("App type not found: {app_type:?}"),
+        )
+    }
+
+    fn app_not_supported(app_type: &AppType) -> AppError {
+        AppError::localized(
+            "app_not_supported_yet",
+            format!("应用 '{}' 暂未支持，敬请期待。", app_type.as_str()),
+            format!("App '{}' is not supported yet.", app_type.as_str()),
+        )
+    }
+
+    fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+
+    fn openclaw_primary_model(provider: &Provider) -> Option<String> {
+        Self::openclaw_fragment(provider)
+            .ok()?
+            .get("models")?
+            .as_array()?
+            .first()?
+            .get("id")?
+            .as_str()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(|model| format!("{}/{}", provider.id, model))
+    }
+
+    fn select_openclaw_default(providers: &HashMap<String, Provider>) -> Option<Provider> {
+        let mut candidates = providers
+            .values()
+            .filter(|provider| Self::openclaw_primary_model(provider).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.sort_index
+                .unwrap_or(usize::MAX)
+                .cmp(&right.sort_index.unwrap_or(usize::MAX))
+                .then_with(|| {
+                    left.created_at
+                        .unwrap_or(i64::MAX)
+                        .cmp(&right.created_at.unwrap_or(i64::MAX))
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        candidates.into_iter().next()
+    }
+
+    fn delete_openclaw(state: &AppState, provider_id: &str) -> Result<(), AppError> {
+        let original = state.load_config()?;
+        let live_default = crate::openclaw_config::get_default_model()?;
+        let live_default_provider = live_default
+            .as_ref()
+            .and_then(|model| model.primary.split_once('/').map(|(provider, _)| provider));
+        let mut next = original.clone();
+        let manager = next
+            .get_manager_mut(&AppType::OpenClaw)
+            .ok_or_else(|| Self::app_not_found(&AppType::OpenClaw))?;
+
+        if !manager.providers.contains_key(provider_id) {
+            return Err(AppError::localized(
+                "provider.not_found",
+                format!("供应商不存在: {provider_id}"),
+                format!("Provider not found: {provider_id}"),
+            ));
+        }
+
+        let deleting_tracked_default = manager.current == provider_id;
+        manager.providers.remove(provider_id);
+        let valid_live_default = live_default_provider
+            .filter(|provider| manager.providers.contains_key(*provider))
+            .map(ToString::to_string);
+        let should_update_live_default = live_default_provider == Some(provider_id)
+            || (deleting_tracked_default && valid_live_default.is_none());
+        let replacement = should_update_live_default
+            .then(|| Self::select_openclaw_default(&manager.providers))
+            .flatten();
+
+        manager.current = if should_update_live_default {
+            replacement
+                .as_ref()
+                .map(|provider| provider.id.clone())
+                .unwrap_or_default()
+        } else {
+            valid_live_default
+                .or_else(|| {
+                    manager
+                        .providers
+                        .contains_key(&manager.current)
+                        .then(|| manager.current.clone())
+                })
+                .unwrap_or_default()
+        };
+
+        let backup = Self::capture_live_snapshot(&AppType::OpenClaw)?;
+        state.replace_config(&next)?;
+        let live_result = (|| {
+            crate::openclaw_config::remove_provider(provider_id)?;
+            if should_update_live_default {
+                if let Some(provider) = replacement.as_ref() {
+                    Self::set_openclaw_default(provider)?;
+                } else {
+                    crate::openclaw_config::clear_default_model()?;
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = live_result {
+            if let Err(rollback_error) = Self::rollback_after_failure(state, original, backup) {
+                return Err(AppError::localized(
+                    "provider.delete.rollback_failed",
+                    format!("删除 OpenClaw 供应商失败: {error}；回滚失败: {rollback_error}"),
+                    format!(
+                        "Failed to delete OpenClaw provider: {error}; rollback failed: {rollback_error}"
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    pub fn delete(state: &AppState, app_type: AppType, provider_id: &str) -> Result<(), AppError> {
+        if matches!(app_type, AppType::OpenClaw) {
+            return Self::delete_openclaw(state, provider_id);
+        }
+
+        let provider_snapshot = {
+            let config = state.load_config()?;
+            let manager = config
+                .get_manager(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+            if manager.current == provider_id {
+                return Err(AppError::localized(
+                    "provider.delete.current",
+                    "不能删除当前正在使用的供应商",
+                    "Cannot delete the provider currently in use",
+                ));
+            }
+
+            manager.providers.get(provider_id).cloned().ok_or_else(|| {
+                AppError::localized(
+                    "provider.not_found",
+                    format!("供应商不存在: {provider_id}"),
+                    format!("Provider not found: {provider_id}"),
+                )
+            })?
+        };
+
+        match app_type {
+            AppType::Codex => {
+                crate::codex_config::delete_codex_provider_config(
+                    provider_id,
+                    &provider_snapshot.name,
+                )?;
+            }
+            AppType::Claude => {
+                // 兼容旧版本：历史上会在 Claude 目录内为每个供应商生成 settings-*.json 副本
+                // 这里继续清理这些遗留文件，避免堆积过期配置。
+                let by_name = get_provider_config_path(provider_id, Some(&provider_snapshot.name))?;
+                let by_id = get_provider_config_path(provider_id, None)?;
+                delete_file(&by_name)?;
+                delete_file(&by_id)?;
+            }
+            AppType::Gemini => {
+                // Gemini 使用单一的 .env 文件，不需要删除单独的供应商配置文件
+            }
+            AppType::ClaudeDesktop => {}
+            AppType::Opencode => {
+                crate::opencode_config::remove_provider(provider_id)?;
+            }
+            AppType::OpenClaw => unreachable!("OpenClaw deletion is handled transactionally"),
+            AppType::GrokBuild => {
+                let path = crate::grok_config::get_grok_config_path();
+                if path.exists() {
+                    delete_file(&path)?;
+                }
+            }
+            AppType::Hermes => {
+                crate::hermes_config::remove_provider(provider_id)?;
+            }
+        }
+
+        state.update_config(|config| {
+            let manager = config
+                .get_manager_mut(&app_type)
+                .ok_or_else(|| Self::app_not_found(&app_type))?;
+
+            if manager.current == provider_id {
+                return Err(AppError::localized(
+                    "provider.delete.current",
+                    "不能删除当前正在使用的供应商",
+                    "Cannot delete the provider currently in use",
+                ));
+            }
+
+            manager.providers.remove(provider_id);
+            Ok(())
+        })
+    }
+}
+
+fn auth_binding_mode_is(actual: &str, expected: &str) -> bool {
+    actual.trim().eq_ignore_ascii_case(expected)
+}
+
+fn provider_has_manual_auth_key(provider: &Provider) -> bool {
+    let env = provider.settings_config.get("env");
+    env.and_then(|value| {
+        [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+        ]
+        .into_iter()
+        .find_map(|key| value.get(key))
+    })
+    .or_else(|| {
+        provider
+            .settings_config
+            .get("auth")
+            .and_then(|auth| auth.get("OPENAI_API_KEY"))
+    })
+    .or_else(|| provider.settings_config.get("apiKey"))
+    .or_else(|| provider.settings_config.get("api_key"))
+    .and_then(serde_json::Value::as_str)
+    .map(str::trim)
+    .is_some_and(|value| !value.is_empty())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderSortUpdate {
+    pub id: String,
+    #[serde(rename = "sortIndex")]
+    pub sort_index: usize,
+}
+
+impl ProviderService {
+    pub fn list_universal(
+        state: &AppState,
+    ) -> Result<std::collections::HashMap<String, crate::provider::UniversalProvider>, AppError>
+    {
+        state.db.get_all_universal_providers()
+    }
+
+    pub fn get_universal(
+        state: &AppState,
+        id: &str,
+    ) -> Result<Option<crate::provider::UniversalProvider>, AppError> {
+        state.db.get_universal_provider(id)
+    }
+
+    pub fn upsert_universal(
+        state: &AppState,
+        provider: crate::provider::UniversalProvider,
+    ) -> Result<bool, AppError> {
+        state.db.save_universal_provider(&provider)?;
+        Ok(true)
+    }
+
+    pub fn delete_universal(state: &AppState, id: &str) -> Result<bool, AppError> {
+        let existed = state.db.delete_universal_provider_typed(id)?;
+        if existed {
+            let generated = [
+                (AppType::Claude, format!("universal-claude-{id}")),
+                (AppType::Codex, format!("universal-codex-{id}")),
+                (AppType::Gemini, format!("universal-gemini-{id}")),
+            ];
+            state.update_config(|config| {
+                for (app, provider_id) in generated {
+                    if let Some(manager) = config.get_manager_mut(&app) {
+                        if manager.current != provider_id {
+                            manager.providers.remove(&provider_id);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(existed)
+    }
+
+    pub fn sync_universal_to_apps(state: &AppState, id: &str) -> Result<bool, AppError> {
+        let Some(provider) = state.db.get_universal_provider(id)? else {
+            return Ok(false);
+        };
+        let generated = [
+            (AppType::Claude, provider.to_claude_provider()),
+            (AppType::Codex, provider.to_codex_provider()),
+            (AppType::Gemini, provider.to_gemini_provider()),
+        ];
+        state.update_config(|config| {
+            for (app, maybe_provider) in generated {
+                let provider_id = match &maybe_provider {
+                    Some(provider) => provider.id.clone(),
+                    None => match app {
+                        AppType::Claude => format!("universal-claude-{id}"),
+                        AppType::Codex => format!("universal-codex-{id}"),
+                        AppType::Gemini => format!("universal-gemini-{id}"),
+                        AppType::ClaudeDesktop
+                        | AppType::OpenClaw
+                        | AppType::Opencode
+                        | AppType::GrokBuild
+                        | AppType::Hermes => continue,
+                    },
+                };
+                let manager = config
+                    .get_manager_mut(&app)
+                    .ok_or_else(|| Self::app_not_found(&app))?;
+                if let Some(provider) = maybe_provider {
+                    manager.providers.insert(provider.id.clone(), provider);
+                } else if manager.current != provider_id {
+                    manager.providers.remove(&provider_id);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    pub fn preview_universal(
+        provider: &crate::provider::UniversalProvider,
+    ) -> std::collections::HashMap<String, Provider> {
+        let mut preview = std::collections::HashMap::new();
+        for (app, generated) in [
+            ("claude", provider.to_claude_provider()),
+            ("codex", provider.to_codex_provider()),
+            ("gemini", provider.to_gemini_provider()),
+        ] {
+            if let Some(provider) = generated {
+                preview.insert(app.to_string(), provider);
+            }
+        }
+        preview
+    }
+}

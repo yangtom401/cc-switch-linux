@@ -1,0 +1,10 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://integrate.api.nvidia.com",
+    "ANTHROPIC_AUTH_TOKEN": "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",
+    "ANTHROPIC_MODEL": "deepseek-ai/deepseek-v4-flash-0731",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash-0731",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "nvidia/nemotron-3-super-120b-a12b",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-haiku-4-5-20251001"
+  }
+}

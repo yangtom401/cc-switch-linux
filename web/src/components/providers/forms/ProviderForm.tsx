@@ -1,0 +1,2469 @@
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Form, FormField, FormItem, FormMessage } from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Download, Loader2 } from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { providerSchema, type ProviderFormData } from "@/lib/schemas/provider";
+import { authApi, type AppId, type ManagedAuthAccount } from "@/lib/api";
+import { useCapabilitiesQuery } from "@/lib/query";
+import {
+  fetchCodexOauthModels,
+  fetchGithubCopilotModels,
+  showFetchModelsError,
+  type FetchedModel,
+} from "@/lib/api/model-fetch";
+import type {
+  ClaudeDesktopMode,
+  ClaudeDesktopModelRoute,
+  ProviderCategory,
+  ProviderMeta,
+  ProviderAuthBinding,
+} from "@/types";
+import {
+  providerPresets,
+  type ProviderPreset,
+} from "@/config/claudeProviderPresets";
+import {
+  codexProviderPresets as CODEX_PROVIDER_PRESETS,
+} from "@/config/codexProviderPresets";
+import type { CodexProviderPreset } from "@/config/codexProviderPresets";
+import {
+  geminiProviderPresets,
+  type GeminiProviderPreset,
+} from "@/config/geminiProviderPresets";
+import {
+  opencodeProviderPresets,
+  type OpenCodeProviderPreset,
+} from "@/config/opencodeProviderPresets";
+import {
+  openclawProviderPresets,
+  type OpenClawProviderPreset,
+} from "@/config/openclawProviderPresets";
+import {
+  CLAUDE_DESKTOP_ROLE_ROUTE_IDS,
+  claudeDesktopProviderPresets,
+  type ClaudeDesktopApiFormat,
+  type ClaudeDesktopProviderPreset,
+} from "@/config/claudeDesktopProviderPresets";
+import { applyTemplateValues } from "@/utils/providerConfigUtils";
+import { mergeProviderMeta } from "@/utils/providerMetaUtils";
+import { getCodexCustomTemplate } from "@/config/codexTemplates";
+import CodexConfigEditor from "./CodexConfigEditor";
+import { CommonConfigEditor } from "./CommonConfigEditor";
+import GeminiConfigEditor from "./GeminiConfigEditor";
+import { ProviderPresetSelector } from "./ProviderPresetSelector";
+import { BasicFormFields } from "./BasicFormFields";
+import { ClaudeFormFields } from "./ClaudeFormFields";
+import { CodexFormFields } from "./CodexFormFields";
+import { GeminiFormFields } from "./GeminiFormFields";
+import { OpenCodeFormFields } from "./OpenCodeFormFields";
+import { ApiKeySection, ModelDropdown } from "./shared";
+import {
+  OPENCODE_DEFAULT_CONFIG,
+  parseOpencodeConfig,
+} from "./helpers/opencodeFormUtils";
+import {
+  useProviderCategory,
+  useApiKeyState,
+  useBaseUrlState,
+  useModelState,
+  useCodexConfigState,
+  useApiKeyLink,
+  useTemplateValues,
+  useCommonConfigSnippet,
+  useCodexCommonConfig,
+  useSpeedTestEndpoints,
+  useCodexTomlValidation,
+  useGeminiConfigState,
+  useGeminiCommonConfig,
+} from "./hooks";
+import { useOpencodeConfigState } from "./hooks/useOpencodeConfigState";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+
+const CLAUDE_DEFAULT_CONFIG = JSON.stringify({ env: {} }, null, 2);
+const CLAUDE_DESKTOP_DEFAULT_CONFIG = JSON.stringify(
+  {
+    env: {
+      ANTHROPIC_BASE_URL: "",
+      ANTHROPIC_AUTH_TOKEN: "",
+    },
+  },
+  null,
+  2,
+);
+const CODEX_DEFAULT_CONFIG = JSON.stringify({ auth: {}, config: "" }, null, 2);
+const GEMINI_DEFAULT_CONFIG = JSON.stringify(
+  {
+    env: {
+      GOOGLE_GEMINI_BASE_URL: "",
+      GEMINI_API_KEY: "",
+      GEMINI_MODEL: "gemini-3-pro-preview",
+    },
+  },
+  null,
+  2,
+);
+const GROKBUILD_DEFAULT_CONFIG = JSON.stringify(
+  {
+    config: `[models]
+default = ""
+
+[model.""]
+model = ""
+base_url = ""
+name = ""
+api_key = ""
+api_backend = "responses"
+context_window = 500000
+`,
+  },
+  null,
+  2,
+);
+
+const HERMES_DEFAULT_CONFIG = JSON.stringify(
+  {
+    base_url: "https://api.anthropic.com/v1",
+    api_key: "",
+    api_mode: "chat_completions",
+  },
+  null,
+  2,
+);
+
+type PresetEntry = {
+  id: string;
+  preset:
+    | ProviderPreset
+    | ClaudeDesktopProviderPreset
+    | CodexProviderPreset
+    | GeminiProviderPreset
+    | OpenCodeProviderPreset
+    | OpenClawProviderPreset;
+};
+
+type ClaudeDesktopRouteRole = keyof typeof CLAUDE_DESKTOP_ROLE_ROUTE_IDS;
+
+type ClaudeDesktopRouteRow = {
+  role: ClaudeDesktopRouteRole;
+  routeId: string;
+  model: string;
+  labelOverride: string;
+  supports1m: boolean;
+};
+
+type AuthMode = "managed" | "api_key";
+type ManagedProviderType = "github_copilot" | "codex_oauth";
+
+function normalizeManagedProviderType(
+  value?: string | null,
+): ManagedProviderType | undefined {
+  const normalized = value
+    ?.trim()
+    .toLowerCase()
+    .replace(/[-\s]+/g, "_");
+  if (
+    normalized === "github_copilot" ||
+    normalized === "githubcopilot" ||
+    normalized === "copilot"
+  ) {
+    return "github_copilot";
+  }
+  if (
+    normalized === "codex_oauth" ||
+    normalized === "codexoauth" ||
+    normalized === "codex" ||
+    normalized === "chatgpt" ||
+    normalized === "chat_gpt"
+  ) {
+    return "codex_oauth";
+  }
+  return undefined;
+}
+
+function normalizeAuthMode(value?: string | null): AuthMode | undefined {
+  const normalized = value
+    ?.trim()
+    .toLowerCase()
+    .replace(/[-\s]+/g, "_");
+  if (normalized === "managed") return "managed";
+  if (normalized === "api_key" || normalized === "apikey") return "api_key";
+  return undefined;
+}
+
+function isManagedAccountUsable(account: ManagedAuthAccount): boolean {
+  return account.status?.trim().toLowerCase() !== "logged_out";
+}
+
+function managedProviderTypeFromMeta(
+  meta?: ProviderMeta,
+): ManagedProviderType | undefined {
+  const providerType =
+    meta?.authBinding?.providerType ?? meta?.providerType ?? undefined;
+  return normalizeManagedProviderType(providerType);
+}
+
+function authModeFromMeta(
+  meta?: ProviderMeta,
+  settingsConfig?: Record<string, unknown>,
+): AuthMode {
+  const explicitMode = normalizeAuthMode(meta?.authBinding?.mode);
+  if (explicitMode) return explicitMode;
+  if (!managedProviderTypeFromMeta(meta)) return "api_key";
+  return hasManualAuthKey(settingsConfig) ? "api_key" : "managed";
+}
+
+function managedProviderTypeForPreset(
+  appId: AppId,
+  activePreset: { providerType?: string } | null,
+  initialMeta?: ProviderMeta,
+): ManagedProviderType | undefined {
+  const fromPreset = normalizeManagedProviderType(activePreset?.providerType);
+  if (fromPreset) {
+    return fromPreset;
+  }
+  if (activePreset) {
+    return undefined;
+  }
+  const fromMeta = managedProviderTypeFromMeta(initialMeta);
+  if (fromMeta) return fromMeta;
+  if (
+    appId === "codex" &&
+    normalizeManagedProviderType(initialMeta?.providerType) === "codex_oauth"
+  ) {
+    return "codex_oauth";
+  }
+  return undefined;
+}
+
+function providerTypeFromPresetForApp(
+  appId: AppId,
+  preset: PresetEntry["preset"],
+): ManagedProviderType | undefined {
+  const providerType =
+    appId === "claude-desktop"
+      ? (preset as ClaudeDesktopProviderPreset).providerType
+      : appId === "codex"
+        ? (preset as CodexProviderPreset).providerType
+        : appId === "claude"
+          ? (preset as ProviderPreset).providerType
+          : undefined;
+  return normalizeManagedProviderType(providerType);
+}
+
+function stripManagedAuthMeta(meta?: ProviderMeta): ProviderMeta | undefined {
+  if (!meta) return meta;
+  const {
+    authBinding: _authBinding,
+    githubAccountId: _githubAccountId,
+    promptCacheKey: _promptCacheKey,
+    codexFastMode: _codexFastMode,
+    providerType,
+    ...rest
+  } = meta;
+  return {
+    ...rest,
+    ...(providerType && !normalizeManagedProviderType(providerType)
+      ? { providerType }
+      : {}),
+  };
+}
+
+function routeRowsFromMeta(meta?: ProviderMeta): ClaudeDesktopRouteRow[] {
+  const routes = meta?.claudeDesktopModelRoutes ?? {};
+  return (["sonnet", "opus", "haiku"] as ClaudeDesktopRouteRole[]).map(
+    (role) => {
+      const routeId = CLAUDE_DESKTOP_ROLE_ROUTE_IDS[role];
+      const route = routes[routeId];
+      return {
+        role,
+        routeId,
+        model: route?.model ?? "",
+        labelOverride: route?.labelOverride ?? "",
+        supports1m: route?.supports1m ?? false,
+      };
+    },
+  );
+}
+
+function routeMapFromRows(
+  rows: ClaudeDesktopRouteRow[],
+): Record<string, ClaudeDesktopModelRoute> {
+  return rows.reduce<Record<string, ClaudeDesktopModelRoute>>((acc, row) => {
+    const model = row.model.trim();
+    if (!model) return acc;
+    acc[row.routeId] = {
+      model,
+      ...(row.labelOverride.trim()
+        ? { labelOverride: row.labelOverride.trim() }
+        : {}),
+      ...(row.supports1m ? { supports1m: true } : {}),
+    };
+    return acc;
+  }, {});
+}
+
+function hasManualAuthKey(settingsConfig?: Record<string, unknown>): boolean {
+  const env =
+    settingsConfig?.env && typeof settingsConfig.env === "object"
+      ? (settingsConfig.env as Record<string, unknown>)
+      : {};
+  const auth =
+    settingsConfig?.auth && typeof settingsConfig.auth === "object"
+      ? (settingsConfig.auth as Record<string, unknown>)
+      : {};
+  return [
+    env.ANTHROPIC_AUTH_TOKEN,
+    env.ANTHROPIC_API_KEY,
+    env.OPENROUTER_API_KEY,
+    env.OPENAI_API_KEY,
+    env.GEMINI_API_KEY,
+    auth.OPENAI_API_KEY,
+    settingsConfig?.apiKey,
+    settingsConfig?.api_key,
+  ].some((value) => typeof value === "string" && value.trim().length > 0);
+}
+
+function configuredEndpoint(settingsConfig?: Record<string, unknown>): string {
+  const env =
+    settingsConfig?.env && typeof settingsConfig.env === "object"
+      ? (settingsConfig.env as Record<string, unknown>)
+      : {};
+  for (const value of [
+    env.ANTHROPIC_BASE_URL,
+    env.OPENAI_BASE_URL,
+    env.GOOGLE_GEMINI_BASE_URL,
+    settingsConfig?.baseUrl,
+    settingsConfig?.base_url,
+  ]) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function stripManualAuthKeysForManagedMode(
+  appId: AppId,
+  settingsConfig: string,
+  apiKeyField: string,
+): string {
+  if (appId === "codex") {
+    try {
+      const parsed = JSON.parse(settingsConfig) as Record<string, unknown>;
+      const auth =
+        parsed.auth && typeof parsed.auth === "object"
+          ? { ...(parsed.auth as Record<string, unknown>) }
+          : {};
+      auth.OPENAI_API_KEY = "";
+      return JSON.stringify({ ...parsed, auth });
+    } catch {
+      return settingsConfig;
+    }
+  }
+
+  if (appId === "claude" || appId === "claude-desktop") {
+    try {
+      const parsed = JSON.parse(settingsConfig) as Record<string, unknown>;
+      const env =
+        parsed.env && typeof parsed.env === "object"
+          ? { ...(parsed.env as Record<string, unknown>) }
+          : {};
+      env.ANTHROPIC_AUTH_TOKEN = "";
+      env.ANTHROPIC_API_KEY = "";
+      env.OPENROUTER_API_KEY = "";
+      env.OPENAI_API_KEY = "";
+      env.GEMINI_API_KEY = "";
+      env[apiKeyField] = "";
+      return JSON.stringify({ ...parsed, env });
+    } catch {
+      return settingsConfig;
+    }
+  }
+
+  return settingsConfig;
+}
+
+function buildClaudeDesktopConfig(
+  baseUrl: string,
+  apiKey: string,
+  apiKeyField: string,
+) {
+  return JSON.stringify(
+    {
+      env: {
+        ANTHROPIC_BASE_URL: baseUrl.trim().replace(/\/+$/, ""),
+        [apiKeyField]: apiKey.trim(),
+      },
+    },
+    null,
+    2,
+  );
+}
+
+function apiKeyFromConfig(config: string, apiKeyField: string) {
+  try {
+    const parsed = JSON.parse(config || "{}");
+    const env = parsed?.env;
+    if (!env || typeof env !== "object") return "";
+    const value =
+      (env as Record<string, unknown>)[apiKeyField] ??
+      (env as Record<string, unknown>).ANTHROPIC_AUTH_TOKEN ??
+      (env as Record<string, unknown>).ANTHROPIC_API_KEY;
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function baseUrlFromConfig(config: string) {
+  try {
+    const parsed = JSON.parse(config || "{}");
+    const value = parsed?.env?.ANTHROPIC_BASE_URL;
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+interface ProviderFormProps {
+  appId: AppId;
+  providerId?: string;
+  submitLabel: string;
+  onSubmit: (values: ProviderFormValues) => Promise<void> | void;
+  onCancel: () => void;
+  initialData?: {
+    name?: string;
+    websiteUrl?: string;
+    notes?: string;
+    settingsConfig?: Record<string, unknown>;
+    category?: ProviderCategory;
+    meta?: ProviderMeta;
+  };
+  showButtons?: boolean;
+}
+
+export function ProviderForm({
+  appId,
+  providerId,
+  submitLabel,
+  onSubmit,
+  onCancel,
+  initialData,
+  showButtons = true,
+}: ProviderFormProps) {
+  const { t } = useTranslation();
+  const { data: capabilities } = useCapabilitiesQuery();
+  const isEditMode = Boolean(initialData);
+  const isGrokbuildHermes = appId === "grokbuild" || appId === "hermes";
+  const [openclawProviderKey, setOpenclawProviderKey] = useState(
+    providerId ?? "",
+  );
+  const supportsPresets =
+    appId === "claude" ||
+    appId === "claude-desktop" ||
+    appId === "codex" ||
+    appId === "gemini" ||
+    appId === "opencode" ||
+    appId === "openclaw";
+  const [claudeDesktopMode, setClaudeDesktopMode] = useState<ClaudeDesktopMode>(
+    initialData?.meta?.claudeDesktopMode ?? "direct",
+  );
+  const [claudeDesktopApiFormat, setClaudeDesktopApiFormat] =
+    useState<ClaudeDesktopApiFormat>(
+      (initialData?.meta?.apiFormat as ClaudeDesktopApiFormat | undefined) ??
+        "anthropic",
+    );
+  const [claudeDesktopApiKeyField, setClaudeDesktopApiKeyField] = useState(
+    initialData?.meta?.apiKeyField ?? "ANTHROPIC_AUTH_TOKEN",
+  );
+  const [claudeDesktopIsFullUrl, setClaudeDesktopIsFullUrl] = useState(
+    initialData?.meta?.isFullUrl ?? false,
+  );
+  const [claudeDesktopBaseUrl, setClaudeDesktopBaseUrl] = useState("");
+  const [claudeDesktopApiKey, setClaudeDesktopApiKey] = useState("");
+  const [claudeDesktopRoutes, setClaudeDesktopRoutes] = useState<
+    ClaudeDesktopRouteRow[]
+  >(() => routeRowsFromMeta(initialData?.meta));
+  const [managedAccounts, setManagedAccounts] = useState<ManagedAuthAccount[]>(
+    [],
+  );
+  const [managedAccountsLoaded, setManagedAccountsLoaded] = useState(false);
+  const [authMode, setAuthMode] = useState<AuthMode>(
+    authModeFromMeta(initialData?.meta, initialData?.settingsConfig),
+  );
+  const [authAccountId, setAuthAccountId] = useState<string>(
+    initialData?.meta?.authBinding?.accountId ??
+      initialData?.meta?.githubAccountId ??
+      "default",
+  );
+  const [codexPromptCacheKey, setCodexPromptCacheKey] = useState(
+    initialData?.meta?.promptCacheKey ?? "",
+  );
+  const [codexFastMode, setCodexFastMode] = useState(
+    initialData?.meta?.codexFastMode ?? false,
+  );
+  const [codexFetchedModels, setCodexFetchedModels] = useState<FetchedModel[]>(
+    [],
+  );
+  const [isFetchingCodexModels, setIsFetchingCodexModels] = useState(false);
+  const [managedFetchedModels, setManagedFetchedModels] = useState<
+    FetchedModel[]
+  >([]);
+  const [isFetchingManagedModels, setIsFetchingManagedModels] = useState(false);
+  const [regularFetchedModels, setRegularFetchedModels] = useState<
+    FetchedModel[]
+  >([]);
+  const [isFetchingRegularModels, setIsFetchingRegularModels] = useState(false);
+
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(
+    initialData ? null : "custom",
+  );
+  const [activePreset, setActivePreset] = useState<{
+    id: string;
+    category?: ProviderCategory;
+    isPartner?: boolean;
+    partnerPromotionKey?: string;
+    providerType?: string;
+  } | null>(null);
+  const [isEndpointModalOpen, setIsEndpointModalOpen] = useState(false);
+  const [isCodexEndpointModalOpen, setIsCodexEndpointModalOpen] =
+    useState(false);
+
+  // 新建供应商：收集端点测速弹窗中的"自定义端点"，提交时一次性落盘到 meta.custom_endpoints
+  // 编辑供应商：端点已通过 API 直接保存，不再需要此状态
+  const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
+    () => {
+      // 仅在新建模式下使用
+      if (initialData) return [];
+      return [];
+    },
+  );
+
+  // 使用 category hook
+  const { category } = useProviderCategory({
+    appId,
+    selectedPresetId,
+    isEditMode,
+    initialCategory: initialData?.category,
+  });
+
+  useEffect(() => {
+    setSelectedPresetId(initialData ? null : "custom");
+    setActivePreset(null);
+    setOpenclawProviderKey(providerId ?? "");
+    if (appId === "claude-desktop") {
+      const nextMode = initialData?.meta?.claudeDesktopMode ?? "direct";
+      const nextFormat =
+        (initialData?.meta?.apiFormat as ClaudeDesktopApiFormat | undefined) ??
+        "anthropic";
+      const nextField =
+        initialData?.meta?.apiKeyField ?? "ANTHROPIC_AUTH_TOKEN";
+      const nextIsFullUrl = initialData?.meta?.isFullUrl ?? false;
+      const nextConfig = initialData?.settingsConfig
+        ? JSON.stringify(initialData.settingsConfig)
+        : CLAUDE_DESKTOP_DEFAULT_CONFIG;
+      setClaudeDesktopMode(nextMode);
+      setClaudeDesktopApiFormat(nextFormat);
+      setClaudeDesktopApiKeyField(nextField);
+      setClaudeDesktopIsFullUrl(nextIsFullUrl);
+      setClaudeDesktopBaseUrl(baseUrlFromConfig(nextConfig));
+      setClaudeDesktopApiKey(apiKeyFromConfig(nextConfig, nextField));
+      setClaudeDesktopRoutes(routeRowsFromMeta(initialData?.meta));
+    }
+    setAuthMode(
+      authModeFromMeta(initialData?.meta, initialData?.settingsConfig),
+    );
+    setAuthAccountId(
+      initialData?.meta?.authBinding?.accountId ??
+        initialData?.meta?.githubAccountId ??
+        "default",
+    );
+    setCodexPromptCacheKey(initialData?.meta?.promptCacheKey ?? "");
+    setCodexFastMode(initialData?.meta?.codexFastMode ?? false);
+
+    // 编辑模式不需要恢复 draftCustomEndpoints，端点已通过 API 管理
+    if (!initialData) {
+      setDraftCustomEndpoints([]);
+    }
+  }, [appId, initialData, providerId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    authApi
+      .listAccounts()
+      .then((accounts) => {
+        if (!cancelled) {
+          setManagedAccounts(accounts);
+          setManagedAccountsLoaded(true);
+        }
+      })
+      .catch((error) => {
+        console.warn("Failed to load managed auth accounts", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const defaultValues: ProviderFormData = useMemo(
+    () => ({
+      name: initialData?.name ?? "",
+      websiteUrl: initialData?.websiteUrl ?? "",
+      notes: initialData?.notes ?? "",
+      settingsConfig: initialData?.settingsConfig
+        ? JSON.stringify(initialData.settingsConfig, null, 2)
+        : appId === "codex"
+          ? CODEX_DEFAULT_CONFIG
+          : appId === "claude-desktop"
+            ? CLAUDE_DESKTOP_DEFAULT_CONFIG
+            : appId === "gemini"
+              ? GEMINI_DEFAULT_CONFIG
+              : appId === "opencode"
+                ? OPENCODE_DEFAULT_CONFIG
+                : appId === "openclaw"
+                  ? JSON.stringify(
+                      {
+                        baseUrl: "",
+                        apiKey: "",
+                        api: "openai-completions",
+                        models: [{ id: "" }],
+                      },
+                      null,
+                      2,
+                    )
+                  : appId === "grokbuild"
+                      ? GROKBUILD_DEFAULT_CONFIG
+                      : appId === "hermes"
+                        ? HERMES_DEFAULT_CONFIG
+                        : CLAUDE_DEFAULT_CONFIG,
+    }),
+    [initialData, appId],
+  );
+
+  const form = useForm<ProviderFormData>({
+    resolver: zodResolver(providerSchema),
+    defaultValues,
+    mode: "onSubmit",
+  });
+  const [softIssues, setSoftIssues] = useState<string[] | null>(null);
+  const [pendingFormValues, setPendingFormValues] =
+    useState<ProviderFormData | null>(null);
+  const [isConfirmSubmitting, setIsConfirmSubmitting] = useState(false);
+  const settingsConfigValue = form.watch("settingsConfig");
+
+  // 使用 API Key hook
+  const {
+    apiKey,
+    handleApiKeyChange,
+    showApiKey: shouldShowApiKey,
+  } = useApiKeyState({
+    initialConfig: settingsConfigValue,
+    onConfigChange: (config) => form.setValue("settingsConfig", config),
+    selectedPresetId,
+    category,
+    appType: appId,
+  });
+  const shouldShowApiKeyField = useMemo(
+    () => shouldShowApiKey(settingsConfigValue, isEditMode),
+    [shouldShowApiKey, settingsConfigValue, isEditMode],
+  );
+
+  // 多 KEY 均衡使用：完整 KEY 列表（含主 KEY，首个为当前主 KEY）
+  const [apiKeys, setApiKeys] = useState<string[]>(() =>
+    (initialData?.meta?.apiKeys ?? []).filter((k) => k.trim()),
+  );
+
+  const handleApiKeysChange = useCallback(
+    (keys: string[]) => {
+      setApiKeys(keys);
+    },
+    [],
+  );
+
+  // 使用 Base URL hook (Claude, Codex, Gemini)
+  const { baseUrl, handleClaudeBaseUrlChange } = useBaseUrlState({
+    appType: appId,
+    category,
+    settingsConfig: settingsConfigValue,
+    codexConfig: "",
+    onSettingsConfigChange: (config) => form.setValue("settingsConfig", config),
+    onCodexConfigChange: () => {
+      /* noop */
+    },
+  });
+
+  // 使用 Model hook（新：主模型 + Haiku/Sonnet/Opus 默认模型）
+  const {
+    claudeModel,
+    defaultHaikuModel,
+    defaultSonnetModel,
+    defaultOpusModel,
+    handleModelChange,
+  } = useModelState({
+    settingsConfig: settingsConfigValue,
+    onConfigChange: (config) => form.setValue("settingsConfig", config),
+  });
+
+  // 使用 Codex 配置 hook (仅 Codex 模式)
+  const {
+    codexAuth,
+    codexConfig,
+    codexApiKey,
+    codexBaseUrl,
+    codexModelName,
+    codexAuthError,
+    setCodexAuth,
+    handleCodexApiKeyChange,
+    handleCodexBaseUrlChange,
+    handleCodexModelNameChange,
+    handleCodexConfigChange: originalHandleCodexConfigChange,
+    resetCodexConfig,
+  } = useCodexConfigState({ initialData });
+
+  // 使用 Codex TOML 校验 hook (仅 Codex 模式)
+  const { configError: codexConfigError, debouncedValidate } =
+    useCodexTomlValidation();
+
+  // 包装 handleCodexConfigChange，添加实时校验
+  const handleCodexConfigChange = useCallback(
+    (value: string) => {
+      originalHandleCodexConfigChange(value);
+      debouncedValidate(value);
+    },
+    [originalHandleCodexConfigChange, debouncedValidate],
+  );
+
+  // Codex 新建模式：初始化时自动填充模板
+  useEffect(() => {
+    if (appId === "codex" && !initialData && selectedPresetId === "custom") {
+      const template = getCodexCustomTemplate();
+      resetCodexConfig(template.auth, template.config);
+    }
+  }, [appId, initialData, selectedPresetId, resetCodexConfig]);
+
+  useEffect(() => {
+    form.reset(defaultValues);
+  }, [defaultValues, form]);
+
+  const presetCategoryLabels: Record<string, string> = useMemo(
+    () => ({
+      official: t("providerForm.categoryOfficial", {
+        defaultValue: "官方",
+      }),
+      cn_official: t("providerForm.categoryCnOfficial", {
+        defaultValue: "国内官方",
+      }),
+      aggregator: t("providerForm.categoryAggregation", {
+        defaultValue: "聚合服务",
+      }),
+      third_party: t("providerForm.categoryThirdParty", {
+        defaultValue: "第三方",
+      }),
+      cloud_provider: t("providerForm.categoryCloudProvider", {
+        defaultValue: "云服务",
+      }),
+      grokbuild: t("apps.grokbuild", {
+        defaultValue: "Grok Build",
+      }),
+      hermes: t("apps.hermes", {
+        defaultValue: "Hermes",
+      }),
+    }),
+    [t],
+  );
+
+  const presetEntries = useMemo(() => {
+    if (appId === "codex") {
+      return CODEX_PROVIDER_PRESETS.map<PresetEntry>((preset, index) => ({
+        id: `codex-${index}`,
+        preset,
+      }));
+    }
+    if (appId === "gemini") {
+      return geminiProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `gemini-${index}`,
+        preset,
+      }));
+    }
+    if (appId === "claude") {
+      return providerPresets.map<PresetEntry>((preset, index) => ({
+        id: `claude-${index}`,
+        preset,
+      }));
+    }
+    if (appId === "claude-desktop") {
+      return claudeDesktopProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `claude-desktop-${index}`,
+        preset,
+      }));
+    }
+    if (appId === "opencode") {
+      return opencodeProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `opencode-${index}`,
+        preset,
+      }));
+    }
+    if (appId === "openclaw") {
+      return openclawProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `openclaw-${index}`,
+        preset,
+      }));
+    }
+    return [];
+  }, [appId]);
+
+  const templatePresetEntries = useMemo<
+    Array<{ id: string; preset: ProviderPreset | CodexProviderPreset }>
+  >(() => {
+    if (appId !== "claude") {
+      return [];
+    }
+    return providerPresets.map((preset, index) => ({
+      id: `claude-${index}`,
+      preset,
+    }));
+  }, [appId]);
+
+  // 使用模板变量 hook (仅 Claude 模式)
+  const {
+    templateValues,
+    templateValueEntries,
+    selectedPreset: templatePreset,
+    handleTemplateValueChange,
+    validateTemplateValues,
+  } = useTemplateValues({
+    selectedPresetId: appId === "claude" ? selectedPresetId : null,
+    presetEntries: templatePresetEntries,
+    settingsConfig: settingsConfigValue,
+    onConfigChange: (config) => form.setValue("settingsConfig", config),
+  });
+
+  // 使用通用配置片段 hook (仅 Claude 模式)
+  const {
+    useCommonConfig,
+    commonConfigSnippet,
+    commonConfigError,
+    handleCommonConfigToggle,
+    handleCommonConfigSnippetChange,
+  } = useCommonConfigSnippet({
+    enabled: appId === "claude",
+    settingsConfig: settingsConfigValue,
+    onConfigChange: (config) => form.setValue("settingsConfig", config),
+    initialData: appId === "claude" ? initialData : undefined,
+  });
+
+  // 使用 Codex 通用配置片段 hook (仅 Codex 模式)
+  const {
+    useCommonConfig: useCodexCommonConfigFlag,
+    commonConfigSnippet: codexCommonConfigSnippet,
+    commonConfigError: codexCommonConfigError,
+    handleCommonConfigToggle: handleCodexCommonConfigToggle,
+    handleCommonConfigSnippetChange: handleCodexCommonConfigSnippetChange,
+  } = useCodexCommonConfig({
+    codexConfig,
+    onConfigChange: handleCodexConfigChange,
+    initialData: appId === "codex" ? initialData : undefined,
+  });
+
+  // 使用 Gemini 配置 hook (仅 Gemini 模式)
+  const {
+    geminiEnv,
+    geminiConfig,
+    geminiApiKey,
+    geminiBaseUrl,
+    geminiModel,
+    envError,
+    configError: geminiConfigError,
+    handleGeminiApiKeyChange: originalHandleGeminiApiKeyChange,
+    handleGeminiBaseUrlChange: originalHandleGeminiBaseUrlChange,
+    handleGeminiEnvChange,
+    handleGeminiConfigChange,
+    resetGeminiConfig,
+    envStringToObj,
+    envObjToString,
+  } = useGeminiConfigState({
+    initialData: appId === "gemini" ? initialData : undefined,
+  });
+
+  // 包装 Gemini handlers 以同步 settingsConfig
+  const handleGeminiApiKeyChange = useCallback(
+    (key: string) => {
+      originalHandleGeminiApiKeyChange(key);
+      // 同步更新 settingsConfig
+      try {
+        const config = JSON.parse(form.watch("settingsConfig") || "{}");
+        if (!config.env) config.env = {};
+        config.env.GEMINI_API_KEY = key.trim();
+        form.setValue("settingsConfig", JSON.stringify(config, null, 2));
+      } catch {
+        // ignore
+      }
+    },
+    [originalHandleGeminiApiKeyChange, form],
+  );
+
+  const handleGeminiBaseUrlChange = useCallback(
+    (url: string) => {
+      originalHandleGeminiBaseUrlChange(url);
+      // 同步更新 settingsConfig
+      try {
+        const config = JSON.parse(form.watch("settingsConfig") || "{}");
+        if (!config.env) config.env = {};
+        config.env.GOOGLE_GEMINI_BASE_URL = url.trim().replace(/\/+$/, "");
+        form.setValue("settingsConfig", JSON.stringify(config, null, 2));
+      } catch {
+        // ignore
+      }
+    },
+    [originalHandleGeminiBaseUrlChange, form],
+  );
+
+  // 使用 Gemini 通用配置 hook (仅 Gemini 模式)
+  const {
+    useCommonConfig: useGeminiCommonConfigFlag,
+    commonConfigSnippet: geminiCommonConfigSnippet,
+    commonConfigError: geminiCommonConfigError,
+    handleCommonConfigToggle: handleGeminiCommonConfigToggle,
+    handleCommonConfigSnippetChange: handleGeminiCommonConfigSnippetChange,
+  } = useGeminiCommonConfig({
+    configValue: geminiConfig,
+    onConfigChange: handleGeminiConfigChange,
+    initialData: appId === "gemini" ? initialData : undefined,
+  });
+
+  const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
+
+  const opencodeState = useOpencodeConfigState({
+    initialData: appId === "opencode" ? initialData : undefined,
+    onSettingsConfigChange: (value) => form.setValue("settingsConfig", value),
+    getSettingsConfig: () => form.watch("settingsConfig"),
+  });
+
+  const managedProviderType = managedProviderTypeForPreset(
+    appId,
+    activePreset,
+    initialData?.meta,
+  );
+  const managedProviderAccounts = useMemo(
+    () =>
+      managedProviderType
+        ? managedAccounts.filter(
+            (account) =>
+              account.provider === managedProviderType &&
+              isManagedAccountUsable(account),
+          )
+        : [],
+    [managedAccounts, managedProviderType],
+  );
+  const shouldShowAuthBinding =
+    Boolean(managedProviderType) &&
+    (appId === "claude" || appId === "claude-desktop" || appId === "codex");
+  const usesManagedAuth = shouldShowAuthBinding && authMode === "managed";
+  const canFetchCodexManagedModels =
+    appId === "codex" &&
+    managedProviderType === "codex_oauth" &&
+    authMode === "managed";
+  const canFetchManagedModels =
+    (appId === "claude" || appId === "claude-desktop") &&
+    Boolean(managedProviderType) &&
+    authMode === "managed";
+  const shouldShowCodexModelField =
+    category !== "official" || managedProviderType === "codex_oauth";
+
+  useEffect(() => {
+    setCodexFetchedModels([]);
+  }, [appId, managedProviderType, authMode, authAccountId]);
+
+  useEffect(() => {
+    setManagedFetchedModels([]);
+  }, [appId, managedProviderType, authMode, authAccountId]);
+
+  useEffect(() => {
+    if (
+      !managedProviderType ||
+      authAccountId === "default" ||
+      authMode !== "managed"
+    ) {
+      return;
+    }
+    if (!managedAccountsLoaded) {
+      return;
+    }
+    const accountMatchesProvider = managedProviderAccounts.some(
+      (account) => account.id === authAccountId,
+    );
+    if (!accountMatchesProvider) {
+      setAuthAccountId("default");
+    }
+  }, [
+    authAccountId,
+    authMode,
+    managedProviderAccounts,
+    managedAccountsLoaded,
+    managedProviderType,
+  ]);
+
+  const handleFetchCodexManagedModels = useCallback(() => {
+    if (!canFetchCodexManagedModels) {
+      toast.info(
+        t("providerForm.fetchModelsManagedOnly", {
+          defaultValue: "只有 Codex OAuth 托管账号支持拉取 live models。",
+        }),
+      );
+      return;
+    }
+
+    setIsFetchingCodexModels(true);
+    fetchCodexOauthModels(authAccountId === "default" ? null : authAccountId)
+      .then((fetched) => {
+        setCodexFetchedModels(fetched);
+        if (fetched.length === 0) {
+          toast.info(t("providerForm.fetchModelsEmpty"));
+          return;
+        }
+        toast.success(
+          t("providerForm.fetchModelsSuccess", { count: fetched.length }),
+        );
+      })
+      .catch((err) => {
+        console.warn("[CodexOAuthModelFetch] Failed:", err);
+        showFetchModelsError(err, t);
+      })
+      .finally(() => setIsFetchingCodexModels(false));
+  }, [authAccountId, canFetchCodexManagedModels, t]);
+
+  const handleFetchManagedModels = useCallback(() => {
+    if (!canFetchManagedModels || !managedProviderType) {
+      toast.info(
+        t("providerForm.fetchModelsManagedOnly", {
+          defaultValue: "只有托管账号模式支持拉取 live models。",
+        }),
+      );
+      return;
+    }
+
+    const fetcher =
+      managedProviderType === "github_copilot"
+        ? fetchGithubCopilotModels
+        : fetchCodexOauthModels;
+
+    setIsFetchingManagedModels(true);
+    fetcher(authAccountId === "default" ? null : authAccountId)
+      .then((fetched) => {
+        setManagedFetchedModels(fetched);
+        if (fetched.length === 0) {
+          toast.info(t("providerForm.fetchModelsEmpty"));
+          return;
+        }
+        toast.success(
+          t("providerForm.fetchModelsSuccess", { count: fetched.length }),
+        );
+      })
+      .catch((err) => {
+        console.warn("[ManagedModelFetch] Failed:", err);
+        showFetchModelsError(err, t);
+      })
+      .finally(() => setIsFetchingManagedModels(false));
+  }, [authAccountId, canFetchManagedModels, managedProviderType, t]);
+
+  const handleFetchRegularClaudeModels = useCallback(() => {
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = settingsConfigValue ? JSON.parse(settingsConfigValue) : {};
+    } catch {
+      /* ignore */
+    }
+    const env = (parsed?.env ?? {}) as Record<string, unknown>;
+    const baseUrl = (env.ANTHROPIC_BASE_URL as string) ?? "";
+    const apiKey = (env.ANTHROPIC_AUTH_TOKEN as string) ?? "";
+    if (!baseUrl || !apiKey) {
+      toast.info(
+        t("providerForm.fetchModelsNeedConfig", {
+          defaultValue: "请先填写 Base URL 和 API Key",
+        }),
+      );
+      return;
+    }
+    setIsFetchingRegularModels(true);
+    const csrfToken =
+      window.__CC_SWITCH_TOKENS__?.csrfToken ?? "";
+    fetch("/api/model-fetch", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "x-csrf-token": csrfToken,
+      },
+      credentials: "include",
+      body: JSON.stringify({ baseUrl, apiKey }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`HTTP ${res.status}: ${text}`);
+        }
+        return res.json();
+      })
+      .then((data) => {
+        const fetched: FetchedModel[] = Array.isArray(data) ? data : [];
+        setRegularFetchedModels(fetched);
+        if (fetched.length === 0) {
+          toast.info(t("providerForm.fetchModelsEmpty"));
+          return;
+        }
+        toast.success(
+          t("providerForm.fetchModelsSuccess", { count: fetched.length }),
+        );
+      })
+      .catch((err) => {
+        console.warn("[RegularModelFetch] Failed:", err);
+        showFetchModelsError(err, t, {
+          hasApiKey: Boolean(apiKey),
+          hasBaseUrl: Boolean(baseUrl),
+        });
+      })
+      .finally(() => setIsFetchingRegularModels(false));
+  }, [settingsConfigValue, t]);
+
+  const buildAuthBindingMeta = (
+    currentMeta?: ProviderMeta,
+  ): ProviderMeta | undefined => {
+    if (!shouldShowAuthBinding || !managedProviderType) {
+      if (activePreset && !activePreset.providerType) {
+        return stripManagedAuthMeta(currentMeta);
+      }
+      return currentMeta;
+    }
+    const nextMeta: ProviderMeta = {
+      ...(currentMeta ?? {}),
+      providerType: managedProviderType,
+      authBinding:
+        authMode === "managed"
+          ? ({
+              mode: "managed",
+              providerType: managedProviderType,
+              useDefault: authAccountId === "default",
+              ...(authAccountId !== "default"
+                ? { accountId: authAccountId }
+                : {}),
+            } satisfies ProviderAuthBinding)
+          : ({
+              mode: "api_key",
+              providerType: managedProviderType,
+            } satisfies ProviderAuthBinding),
+    };
+    if (managedProviderType === "github_copilot") {
+      nextMeta.githubAccountId =
+        authMode === "managed" && authAccountId !== "default"
+          ? authAccountId
+          : undefined;
+    }
+    if (managedProviderType === "codex_oauth" && authMode === "managed") {
+      const cacheKey = codexPromptCacheKey.trim();
+      nextMeta.promptCacheKey = cacheKey || undefined;
+      nextMeta.codexFastMode = codexFastMode || undefined;
+    } else {
+      nextMeta.promptCacheKey = undefined;
+      nextMeta.codexFastMode = undefined;
+    }
+    return nextMeta;
+  };
+
+  const handleSubmit = async (values: ProviderFormData) => {
+    const issues: string[] = [];
+
+    // 空模板变量不会破坏配置结构，但切换后可能无法使用。
+    if (appId === "claude" && templateValueEntries.length > 0) {
+      const validation = validateTemplateValues();
+      if (!validation.isValid && validation.missingField) {
+        issues.push(
+          t("providerForm.fillParameter", {
+            label: validation.missingField.label,
+            defaultValue: `请填写 ${validation.missingField.label}`,
+          }),
+        );
+      }
+    }
+
+    if (!values.name.trim()) {
+      issues.push(
+        t("providerForm.fillSupplierName", {
+          defaultValue: "请填写供应商名称",
+        }),
+      );
+    }
+
+    if (appId === "openclaw") {
+      const key = openclawProviderKey.trim();
+      if (!key) {
+        issues.push(
+          t("openclaw.providerKeyRequired", {
+            defaultValue: "请填写 OpenClaw Provider Key",
+          }),
+        );
+      } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(key)) {
+        issues.push(
+          t("openclaw.providerKeyInvalid", {
+            defaultValue: "Provider Key 只能包含字母、数字、点、下划线和连字符",
+          }),
+        );
+      }
+    }
+
+    if (
+      category !== "official" &&
+      category !== "cloud_provider" &&
+      !usesManagedAuth
+    ) {
+      const addEndpointAndKeyIssues = (endpoint: string, key: string) => {
+        const effectiveEndpoint =
+          endpoint.trim() ||
+          (isEditMode ? configuredEndpoint(initialData?.settingsConfig) : "");
+        if (!effectiveEndpoint) {
+          issues.push(
+            t("providerForm.endpointRequired", {
+              defaultValue: "非官方供应商请填写 API 端点",
+            }),
+          );
+        } else {
+          try {
+            const parsed = new URL(effectiveEndpoint);
+            if (!["http:", "https:"].includes(parsed.protocol))
+              throw new Error();
+          } catch {
+            issues.push(
+              t("providerForm.endpointInvalid", {
+                defaultValue: "API 端点不是有效的 HTTP(S) URL",
+              }),
+            );
+          }
+        }
+        const hasExistingKey =
+          isEditMode && hasManualAuthKey(initialData?.settingsConfig);
+        if (!key.trim() && !hasExistingKey) {
+          issues.push(
+            t("providerForm.apiKeyRequired", {
+              defaultValue: "非官方供应商请填写 API Key",
+            }),
+          );
+        }
+      };
+
+      if (appId === "claude") {
+        addEndpointAndKeyIssues(baseUrl, apiKey);
+      } else if (appId === "codex") {
+        addEndpointAndKeyIssues(codexBaseUrl, codexApiKey);
+      } else if (appId === "gemini") {
+        addEndpointAndKeyIssues(geminiBaseUrl, geminiApiKey);
+      }
+    }
+
+    if (issues.length > 0) {
+      setSoftIssues(Array.from(new Set(issues)));
+      setPendingFormValues(values);
+      return;
+    }
+
+    await performSubmit(values);
+  };
+
+  const performSubmit = async (values: ProviderFormData) => {
+    let settingsConfig: string;
+
+    // Codex: 组合 auth 和 config
+    if (appId === "codex") {
+      try {
+        const authJson = JSON.parse(codexAuth);
+        const configObj = {
+          auth: authJson,
+          config: codexConfig ?? "",
+        };
+        settingsConfig = JSON.stringify(configObj);
+      } catch (err) {
+        // 如果解析失败，使用表单中的配置
+        settingsConfig = values.settingsConfig.trim();
+      }
+    } else if (appId === "claude-desktop") {
+      settingsConfig = buildClaudeDesktopConfig(
+        claudeDesktopBaseUrl,
+        claudeDesktopApiKey,
+        claudeDesktopApiKeyField,
+      );
+    } else if (appId === "gemini") {
+      // Gemini: 组合 env 和 config
+      try {
+        const envObj = envStringToObj(geminiEnv);
+        const configObj = geminiConfig.trim() ? JSON.parse(geminiConfig) : {};
+        const combined = {
+          env: envObj,
+          config: configObj,
+        };
+        settingsConfig = JSON.stringify(combined);
+      } catch (err) {
+        // 如果解析失败，使用表单中的配置
+        settingsConfig = values.settingsConfig.trim();
+      }
+    } else if (appId === "opencode") {
+      settingsConfig = values.settingsConfig.trim();
+    } else {
+      // Claude / GrokBuild / Hermes: 使用表单配置
+      settingsConfig = values.settingsConfig.trim();
+    }
+
+    const payload: ProviderFormValues = {
+      ...values,
+      name: values.name.trim(),
+      websiteUrl: values.websiteUrl?.trim() ?? "",
+      settingsConfig,
+      ...(appId === "openclaw"
+        ? { providerKey: openclawProviderKey.trim() }
+        : {}),
+    };
+    if (usesManagedAuth) {
+      payload.settingsConfig = stripManualAuthKeysForManagedMode(
+        appId,
+        payload.settingsConfig,
+        claudeDesktopApiKeyField,
+      );
+    }
+
+    if (activePreset) {
+      payload.presetId = activePreset.id;
+      if (activePreset.category) {
+        payload.presetCategory = activePreset.category;
+      }
+      // 继承合作伙伴标识
+      if (activePreset.isPartner) {
+        payload.isPartner = activePreset.isPartner;
+      }
+    }
+    if (isGrokbuildHermes && !payload.presetCategory) {
+      payload.presetCategory = appId;
+    }
+    if (appId === "claude-desktop") {
+      payload.meta = {
+        ...(initialData?.meta ?? {}),
+        ...(payload.meta ?? {}),
+        claudeDesktopMode,
+        claudeDesktopModelRoutes: routeMapFromRows(claudeDesktopRoutes),
+        apiFormat: claudeDesktopApiFormat,
+        apiKeyField: claudeDesktopApiKeyField,
+        isFullUrl: claudeDesktopIsFullUrl || undefined,
+        ...(activePreset?.providerType
+          ? { providerType: activePreset.providerType }
+          : {}),
+        ...(activePreset?.isPartner ? { isPartner: true } : {}),
+        ...(activePreset?.partnerPromotionKey
+          ? { partnerPromotionKey: activePreset.partnerPromotionKey }
+          : {}),
+      };
+    }
+
+    // 处理 meta 字段：仅在新建模式下从 draftCustomEndpoints 生成 custom_endpoints
+    // 编辑模式：端点已通过 API 直接保存，不在此处理
+    if (!isEditMode && draftCustomEndpoints.length > 0) {
+      const customEndpointsToSave: Record<
+        string,
+        import("@/types").CustomEndpoint
+      > = draftCustomEndpoints.reduce(
+        (acc, url) => {
+          const now = Date.now();
+          acc[url] = { url, addedAt: now, lastUsed: undefined };
+          return acc;
+        },
+        {} as Record<string, import("@/types").CustomEndpoint>,
+      );
+
+      // 检测是否需要清空端点（重要：区分"用户清空端点"和"用户没有修改端点"）
+      const hadEndpoints =
+        initialData?.meta?.custom_endpoints &&
+        Object.keys(initialData.meta.custom_endpoints).length > 0;
+      const needsClearEndpoints =
+        hadEndpoints && draftCustomEndpoints.length === 0;
+
+      // 如果用户明确清空了端点，传递空对象（而不是 null）让后端知道要删除
+      let mergedMeta = needsClearEndpoints
+        ? mergeProviderMeta(initialData?.meta, {})
+        : mergeProviderMeta(initialData?.meta, customEndpointsToSave);
+
+      // 添加合作伙伴标识与促销 key
+      if (activePreset?.isPartner) {
+        mergedMeta = {
+          ...(mergedMeta ?? {}),
+          isPartner: true,
+        };
+      }
+
+      if (activePreset?.partnerPromotionKey) {
+        mergedMeta = {
+          ...(mergedMeta ?? {}),
+          partnerPromotionKey: activePreset.partnerPromotionKey,
+        };
+      }
+
+      if (mergedMeta !== undefined) {
+        payload.meta = mergedMeta;
+      }
+    }
+
+    const authMeta = buildAuthBindingMeta(payload.meta ?? initialData?.meta);
+    if (authMeta) {
+      payload.meta = authMeta;
+    }
+
+    // 多 KEY 均衡使用：把完整 KEY 列表写入 meta.apiKeys（首个为当前主 KEY）
+    const cleanedApiKeys = (apiKeys ?? [])
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0);
+    if (cleanedApiKeys.length > 0) {
+      payload.meta = {
+        ...(payload.meta ?? {}),
+        apiKeys: cleanedApiKeys,
+        apiKeyIndex: 0,
+      };
+    }
+
+    await onSubmit(payload);
+  };
+
+  const groupedPresets = useMemo(() => {
+    return presetEntries.reduce<Record<string, PresetEntry[]>>((acc, entry) => {
+      const category = entry.preset.category ?? "others";
+      if (!acc[category]) {
+        acc[category] = [];
+      }
+      acc[category].push(entry);
+      return acc;
+    }, {});
+  }, [presetEntries]);
+
+  const categoryKeys = useMemo(() => {
+    return Object.keys(groupedPresets).filter(
+      (key) => key !== "custom" && groupedPresets[key]?.length,
+    );
+  }, [groupedPresets]);
+
+  // 判断是否显示端点测速（仅官方类别不显示）
+  const shouldShowSpeedTest =
+    category !== "official" && capabilities?.features.endpointTest === true;
+
+  // 使用 API Key 链接 hook (Claude)
+  const {
+    shouldShowApiKeyLink: shouldShowClaudeApiKeyLink,
+    websiteUrl: claudeWebsiteUrl,
+    isPartner: isClaudePartner,
+    partnerPromotionKey: claudePartnerPromotionKey,
+  } = useApiKeyLink({
+    appId: "claude",
+    category,
+    selectedPresetId,
+    presetEntries,
+    formWebsiteUrl: form.watch("websiteUrl") || "",
+  });
+
+  // 使用 API Key 链接 hook (Codex)
+  const {
+    shouldShowApiKeyLink: shouldShowCodexApiKeyLink,
+    websiteUrl: codexWebsiteUrl,
+    isPartner: isCodexPartner,
+    partnerPromotionKey: codexPartnerPromotionKey,
+  } = useApiKeyLink({
+    appId: "codex",
+    category,
+    selectedPresetId,
+    presetEntries,
+    formWebsiteUrl: form.watch("websiteUrl") || "",
+  });
+
+  // 使用 API Key 链接 hook (Gemini)
+  const {
+    shouldShowApiKeyLink: shouldShowGeminiApiKeyLink,
+    websiteUrl: geminiWebsiteUrl,
+    isPartner: isGeminiPartner,
+    partnerPromotionKey: geminiPartnerPromotionKey,
+  } = useApiKeyLink({
+    appId: "gemini",
+    category,
+    selectedPresetId,
+    presetEntries,
+    formWebsiteUrl: form.watch("websiteUrl") || "",
+  });
+
+  const {
+    shouldShowApiKeyLink: shouldShowOpencodeApiKeyLink,
+    websiteUrl: opencodeWebsiteUrl,
+    isPartner: isOpencodePartner,
+    partnerPromotionKey: opencodePartnerPromotionKey,
+  } = useApiKeyLink({
+    appId: "opencode",
+    category,
+    selectedPresetId,
+    presetEntries,
+    formWebsiteUrl: form.watch("websiteUrl") || "",
+  });
+
+  // 使用端点测速候选 hook
+  const speedTestEndpoints = useSpeedTestEndpoints({
+    appId,
+    selectedPresetId,
+    presetEntries,
+    baseUrl,
+    codexBaseUrl,
+    initialData,
+  });
+
+  const handlePresetChange = (value: string) => {
+    setSelectedPresetId(value);
+    if (value === "custom") {
+      setActivePreset(null);
+      setCodexPromptCacheKey("");
+      setCodexFastMode(false);
+      form.reset(defaultValues);
+
+      // Codex 自定义模式：加载模板
+      if (appId === "codex") {
+        const template = getCodexCustomTemplate();
+        resetCodexConfig(template.auth, template.config);
+      }
+      // Gemini 自定义模式：重置为空配置
+      if (appId === "gemini") {
+        resetGeminiConfig({}, {});
+      }
+      if (appId === "opencode") {
+        opencodeState.reset();
+      }
+      if (appId === "openclaw") {
+        setOpenclawProviderKey("");
+      }
+      return;
+    }
+
+    const entry = presetEntries.find((item) => item.id === value);
+    if (!entry) {
+      return;
+    }
+
+    setActivePreset({
+      id: value,
+      category: entry.preset.category,
+      isPartner: entry.preset.isPartner,
+      partnerPromotionKey: entry.preset.partnerPromotionKey,
+      providerType: providerTypeFromPresetForApp(appId, entry.preset),
+    });
+    const nextProviderType = providerTypeFromPresetForApp(appId, entry.preset);
+    setAuthMode(nextProviderType ? "managed" : "api_key");
+    setAuthAccountId("default");
+    setCodexPromptCacheKey("");
+    setCodexFastMode(false);
+
+    if (appId === "codex") {
+      const preset = entry.preset as CodexProviderPreset;
+      const auth = preset.auth ?? {};
+      const config = preset.config ?? "";
+
+      // 重置 Codex 配置
+      resetCodexConfig(auth, config);
+
+      // 更新表单其他字段
+      form.reset({
+        name: preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        settingsConfig: JSON.stringify({ auth, config }, null, 2),
+      });
+      return;
+    }
+
+    if (appId === "gemini") {
+      const preset = entry.preset as GeminiProviderPreset;
+      const env = (preset.settingsConfig as any)?.env ?? {};
+      const config = (preset.settingsConfig as any)?.config ?? {};
+
+      // 重置 Gemini 配置
+      resetGeminiConfig(env, config);
+
+      // 更新表单其他字段
+      form.reset({
+        name: preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        settingsConfig: JSON.stringify(preset.settingsConfig, null, 2),
+      });
+      return;
+    }
+
+    if (appId === "opencode") {
+      const preset = entry.preset as OpenCodeProviderPreset;
+      if (preset.category === "grokbuild" || preset.category === "hermes") {
+        form.reset({
+          name: t(`apps.${preset.category}`, {
+            defaultValue: preset.category === "hermes" ? "Hermes" : "Grok Build",
+          }),
+          websiteUrl: preset.websiteUrl ?? "",
+          notes: "",
+          settingsConfig: JSON.stringify({}, null, 2),
+        });
+        return;
+      }
+
+      const config = parseOpencodeConfig(preset.settingsConfig);
+      opencodeState.reset(config);
+      form.reset({
+        name: preset.nameKey ? t(preset.nameKey) : preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        notes: "",
+        settingsConfig: JSON.stringify(config, null, 2),
+      });
+      return;
+    }
+
+    if (appId === "openclaw") {
+      const preset = entry.preset as OpenClawProviderPreset;
+      setOpenclawProviderKey(preset.providerKey);
+      form.reset({
+        name: preset.nameKey ? t(preset.nameKey) : preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        notes: "",
+        settingsConfig: JSON.stringify(preset.settingsConfig, null, 2),
+      });
+      return;
+    }
+
+    if (appId === "claude-desktop") {
+      const preset = entry.preset as ClaudeDesktopProviderPreset;
+      const apiKeyField = preset.apiKeyField ?? "ANTHROPIC_AUTH_TOKEN";
+      const rows = routeRowsFromMeta({
+        claudeDesktopModelRoutes: Object.fromEntries(
+          (preset.modelRoutes ?? []).map((route) => [
+            route.routeId,
+            {
+              model: route.upstreamModel,
+              ...(route.labelOverride
+                ? { labelOverride: route.labelOverride }
+                : {}),
+              ...(route.supports1m ? { supports1m: true } : {}),
+            },
+          ]),
+        ),
+      });
+
+      setClaudeDesktopMode(preset.mode);
+      setClaudeDesktopApiFormat(preset.apiFormat ?? "anthropic");
+      setClaudeDesktopApiKeyField(apiKeyField);
+      setClaudeDesktopIsFullUrl(false);
+      setClaudeDesktopBaseUrl(preset.baseUrl);
+      setClaudeDesktopApiKey("");
+      setClaudeDesktopRoutes(rows);
+      form.reset({
+        name: preset.nameKey ? t(preset.nameKey) : preset.name,
+        websiteUrl: preset.websiteUrl ?? "",
+        notes: "",
+        settingsConfig: buildClaudeDesktopConfig(
+          preset.baseUrl,
+          "",
+          apiKeyField,
+        ),
+      });
+      return;
+    }
+
+    const preset = entry.preset as ProviderPreset;
+    const config = applyTemplateValues(
+      preset.settingsConfig,
+      preset.templateValues,
+    );
+
+    form.reset({
+      name: preset.name,
+      websiteUrl: preset.websiteUrl ?? "",
+      settingsConfig: JSON.stringify(config, null, 2),
+    });
+  };
+
+  return (
+    <Form {...form}>
+      <form
+        id="provider-form"
+        onSubmit={form.handleSubmit(handleSubmit)}
+        className="space-y-6"
+      >
+        {/* 预设供应商选择（仅新增模式显示） */}
+        {!initialData && supportsPresets ? (
+          <ProviderPresetSelector
+            selectedPresetId={selectedPresetId}
+            groupedPresets={groupedPresets}
+            categoryKeys={categoryKeys}
+            presetCategoryLabels={presetCategoryLabels}
+            onPresetChange={handlePresetChange}
+            category={category}
+          />
+        ) : null}
+
+        {/* 基础字段 */}
+        <BasicFormFields form={form} />
+
+        {appId === "openclaw" ? (
+          <div className="space-y-2">
+            <Label htmlFor="openclaw-provider-key">
+              {t("openclaw.providerKey", { defaultValue: "Provider Key" })}
+            </Label>
+            <Input
+              id="openclaw-provider-key"
+              value={openclawProviderKey}
+              onChange={(event) => setOpenclawProviderKey(event.target.value)}
+              placeholder="deepseek"
+              autoComplete="off"
+              disabled={isEditMode}
+            />
+            <p className="text-xs text-muted-foreground">
+              {isEditMode
+                ? t("openclaw.providerKeyLockedHint", {
+                    defaultValue: "已写入 live 配置的 Provider Key 不可修改。",
+                  })
+                : t("openclaw.providerKeyHint", {
+                    defaultValue:
+                      "此值会成为 models.providers 下的键，例如 deepseek。",
+                  })}
+            </p>
+          </div>
+        ) : null}
+
+        {shouldShowAuthBinding && managedProviderType ? (
+          <div className="space-y-3 rounded-md border border-border-default p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  {t("providerForm.authBinding", {
+                    defaultValue: "认证方式",
+                  })}
+                  <Badge variant="secondary">
+                    {managedProviderType === "github_copilot"
+                      ? "GitHub Copilot"
+                      : "Codex OAuth"}
+                  </Badge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t("providerForm.authBindingHint", {
+                    defaultValue:
+                      "使用认证中心托管账号时，代理会动态注入真实 token。",
+                  })}
+                </p>
+              </div>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>
+                  {t("providerForm.authMode", {
+                    defaultValue: "模式",
+                  })}
+                </Label>
+                <Select
+                  value={authMode}
+                  onValueChange={(value) => setAuthMode(value as AuthMode)}
+                >
+                  <SelectTrigger
+                    aria-label={t("providerForm.authMode", {
+                      defaultValue: "模式",
+                    })}
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="managed">
+                      {t("providerForm.authManaged", {
+                        defaultValue: "使用托管账号",
+                      })}
+                    </SelectItem>
+                    <SelectItem value="api_key">
+                      {t("providerForm.authApiKey", {
+                        defaultValue: "手动 API Key",
+                      })}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {authMode === "managed" ? (
+                <div className="space-y-2">
+                  <Label>
+                    {t("providerForm.authAccount", {
+                      defaultValue: "账号",
+                    })}
+                  </Label>
+                  <Select
+                    value={authAccountId}
+                    onValueChange={setAuthAccountId}
+                  >
+                    <SelectTrigger
+                      aria-label={t("providerForm.authAccount", {
+                        defaultValue: "账号",
+                      })}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="default">
+                        {t("providerForm.authDefaultAccount", {
+                          defaultValue: "默认账号",
+                        })}
+                      </SelectItem>
+                      {managedProviderAccounts.map((account) => (
+                        <SelectItem key={account.id} value={account.id}>
+                          {account.label}
+                          {account.isDefault
+                            ? ` (${t("providerForm.authDefaultAccount", {
+                                defaultValue: "默认账号",
+                              })})`
+                            : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  {managedProviderAccounts.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("providerForm.authNoAccounts", {
+                        defaultValue:
+                          "认证中心还没有该类型账号；可先保存绑定默认账号，登录后自动生效。",
+                      })}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+            {managedProviderType === "codex_oauth" && authMode === "managed" ? (
+              <div className="grid gap-3 rounded-md border border-border-default p-3 md:grid-cols-[1fr_auto]">
+                <div className="space-y-2">
+                  <Label htmlFor="codex-prompt-cache-key">
+                    {t("providerForm.promptCacheKey", {
+                      defaultValue: "Prompt cache key",
+                    })}
+                  </Label>
+                  <Input
+                    id="codex-prompt-cache-key"
+                    value={codexPromptCacheKey}
+                    onChange={(event) =>
+                      setCodexPromptCacheKey(event.target.value)
+                    }
+                    placeholder="optional"
+                    autoComplete="off"
+                  />
+                </div>
+                <label className="flex items-center justify-between gap-3 self-end rounded-md border border-border-default px-3 py-2 text-sm md:min-w-[150px]">
+                  <span>
+                    {t("providerForm.codexFastMode", {
+                      defaultValue: "FAST mode",
+                    })}
+                  </span>
+                  <Switch
+                    aria-label={t("providerForm.codexFastMode", {
+                      defaultValue: "FAST mode",
+                    })}
+                    checked={codexFastMode}
+                    onCheckedChange={setCodexFastMode}
+                  />
+                </label>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* Claude 专属字段 */}
+        {appId === "claude" && (
+          <ClaudeFormFields
+            providerId={providerId}
+            shouldShowApiKey={shouldShowApiKeyField && !usesManagedAuth}
+            apiKey={apiKey}
+            onApiKeyChange={handleApiKeyChange}
+            category={category}
+            shouldShowApiKeyLink={shouldShowClaudeApiKeyLink}
+            websiteUrl={claudeWebsiteUrl}
+            isPartner={isClaudePartner}
+            partnerPromotionKey={claudePartnerPromotionKey}
+            apiKeys={apiKeys}
+            onApiKeysChange={handleApiKeysChange}
+            templateValueEntries={templateValueEntries}
+            templateValues={templateValues}
+            templatePresetName={templatePreset?.name || ""}
+            onTemplateValueChange={handleTemplateValueChange}
+            shouldShowSpeedTest={shouldShowSpeedTest}
+            baseUrl={baseUrl}
+            onBaseUrlChange={handleClaudeBaseUrlChange}
+            isEndpointModalOpen={isEndpointModalOpen}
+            onEndpointModalToggle={setIsEndpointModalOpen}
+            onCustomEndpointsChange={
+              isEditMode ? undefined : setDraftCustomEndpoints
+            }
+            shouldShowModelSelector={category !== "official"}
+            claudeModel={claudeModel}
+            defaultHaikuModel={defaultHaikuModel}
+            defaultSonnetModel={defaultSonnetModel}
+            defaultOpusModel={defaultOpusModel}
+            onModelChange={handleModelChange}
+            fetchedModels={
+              managedProviderType ? managedFetchedModels : regularFetchedModels
+            }
+            isFetchingModels={
+              managedProviderType
+                ? isFetchingManagedModels
+                : isFetchingRegularModels
+            }
+            onFetchModels={
+              managedProviderType
+                ? handleFetchManagedModels
+                : category !== "official"
+                  ? handleFetchRegularClaudeModels
+                  : undefined
+            }
+            canFetchModels={
+              managedProviderType ? canFetchManagedModels : category !== "official"
+            }
+            fetchModelsHint={
+              managedProviderType
+                ? canFetchManagedModels
+                  ? undefined
+                  : t("providerForm.fetchModelsManagedOnly", {
+                      defaultValue: "只有托管账号模式支持拉取 live models。",
+                    })
+                : undefined
+            }
+            speedTestEndpoints={speedTestEndpoints}
+          />
+        )}
+
+        {appId === "claude-desktop" && (
+          <div className="space-y-5">
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <Label>
+                  {t("providerForm.claudeDesktopMode", {
+                    defaultValue: "写入模式",
+                  })}
+                </Label>
+                <Select
+                  value={claudeDesktopMode}
+                  onValueChange={(value) =>
+                    setClaudeDesktopMode(value as ClaudeDesktopMode)
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="direct">Direct</SelectItem>
+                    <SelectItem value="proxy">Local Routing</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>
+                  {t("providerForm.apiFormat", { defaultValue: "API 格式" })}
+                </Label>
+                <Select
+                  value={claudeDesktopApiFormat}
+                  onValueChange={(value) =>
+                    setClaudeDesktopApiFormat(value as ClaudeDesktopApiFormat)
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="anthropic">Anthropic</SelectItem>
+                    <SelectItem value="openai_chat">OpenAI Chat</SelectItem>
+                    <SelectItem value="openai_responses">
+                      OpenAI Responses
+                    </SelectItem>
+                    <SelectItem value="gemini_native">Gemini Native</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>
+                  {t("providerForm.apiKeyField", { defaultValue: "Key 字段" })}
+                </Label>
+                <Select
+                  value={claudeDesktopApiKeyField}
+                  onValueChange={(value) => {
+                    setClaudeDesktopApiKeyField(value);
+                    form.setValue(
+                      "settingsConfig",
+                      buildClaudeDesktopConfig(
+                        claudeDesktopBaseUrl,
+                        claudeDesktopApiKey,
+                        value,
+                      ),
+                    );
+                  }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ANTHROPIC_AUTH_TOKEN">
+                      ANTHROPIC_AUTH_TOKEN
+                    </SelectItem>
+                    <SelectItem value="ANTHROPIC_API_KEY">
+                      ANTHROPIC_API_KEY
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="claude-desktop-base-url">
+                {t("providerForm.apiEndpoint", {
+                  defaultValue: "API Endpoint",
+                })}
+              </Label>
+              <Input
+                id="claude-desktop-base-url"
+                value={claudeDesktopBaseUrl}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setClaudeDesktopBaseUrl(value);
+                  form.setValue(
+                    "settingsConfig",
+                    buildClaudeDesktopConfig(
+                      value,
+                      claudeDesktopApiKey,
+                      claudeDesktopApiKeyField,
+                    ),
+                  );
+                }}
+                placeholder="https://api.example.com"
+                autoComplete="off"
+              />
+              <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium">
+                    {t("providerForm.fullEndpointUrl", {
+                      defaultValue: "完整端点 URL",
+                    })}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t("providerForm.fullEndpointUrlHint", {
+                      defaultValue:
+                        "转发时直接使用该 URL，不再追加 /v1/messages 等路径",
+                    })}
+                  </div>
+                </div>
+                <Switch
+                  checked={claudeDesktopIsFullUrl}
+                  onCheckedChange={setClaudeDesktopIsFullUrl}
+                />
+              </div>
+            </div>
+
+            {!usesManagedAuth ? (
+              <div className="space-y-2">
+                <ApiKeySection
+                  id="claude-desktop-api-key"
+                  label="API Key"
+                  value={claudeDesktopApiKey}
+                  onChange={(value: string) => {
+                    setClaudeDesktopApiKey(value);
+                    form.setValue(
+                      "settingsConfig",
+                      buildClaudeDesktopConfig(
+                        claudeDesktopBaseUrl,
+                        value,
+                        claudeDesktopApiKeyField,
+                      ),
+                    );
+                  }}
+                  category={category}
+                  shouldShowLink={false}
+                  websiteUrl=""
+                  keys={apiKeys}
+                  onKeysChange={handleApiKeysChange}
+                />
+              </div>
+            ) : null}
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <Label>
+                  {t("providerForm.claudeDesktopRoutes", {
+                    defaultValue: "模型角色映射",
+                  })}
+                </Label>
+                {managedProviderType || category !== "official" ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={
+                      managedProviderType
+                        ? handleFetchManagedModels
+                        : handleFetchRegularClaudeModels
+                    }
+                    disabled={
+                      managedProviderType
+                        ? isFetchingManagedModels || !canFetchManagedModels
+                        : isFetchingRegularModels
+                    }
+                    className="h-7 gap-1"
+                    title={
+                      managedProviderType && !canFetchManagedModels
+                        ? t("providerForm.fetchModelsManagedOnly", {
+                            defaultValue:
+                              "只有托管账号模式支持拉取 live models。",
+                          })
+                        : undefined
+                    }
+                  >
+                    {(managedProviderType
+                      ? isFetchingManagedModels
+                      : isFetchingRegularModels) ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Download className="h-3.5 w-3.5" />
+                    )}
+                    {t("providerForm.fetchModels")}
+                  </Button>
+                ) : null}
+              </div>
+              <div className="space-y-3">
+                {claudeDesktopRoutes.map((row, index) => (
+                  <div
+                    key={row.routeId}
+                    className="grid gap-3 rounded-md border border-border-default p-3 md:grid-cols-[110px_1fr_1fr_90px]"
+                  >
+                    <div className="text-sm font-medium capitalize leading-9">
+                      {row.role}
+                    </div>
+                    <div className="flex gap-1">
+                      <Input
+                        value={row.model}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setClaudeDesktopRoutes((rows) =>
+                            rows.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? { ...item, model: value }
+                                : item,
+                            ),
+                          );
+                        }}
+                        placeholder="upstream-model"
+                        autoComplete="off"
+                      />
+                      {(managedProviderType
+                        ? managedFetchedModels
+                        : regularFetchedModels
+                      ).length > 0 ? (
+                        <ModelDropdown
+                          models={
+                            managedProviderType
+                              ? managedFetchedModels
+                              : regularFetchedModels
+                          }
+                          onSelect={(id) => {
+                            setClaudeDesktopRoutes((rows) =>
+                              rows.map((item, itemIndex) =>
+                                itemIndex === index
+                                  ? { ...item, model: id }
+                                  : item,
+                              ),
+                            );
+                          }}
+                        />
+                      ) : null}
+                    </div>
+                    <Input
+                      value={row.labelOverride}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setClaudeDesktopRoutes((rows) =>
+                          rows.map((item, itemIndex) =>
+                            itemIndex === index
+                              ? { ...item, labelOverride: value }
+                              : item,
+                          ),
+                        );
+                      }}
+                      placeholder="label"
+                      autoComplete="off"
+                    />
+                    <div className="flex items-center justify-end gap-2">
+                      <span className="text-xs text-muted-foreground">1M</span>
+                      <Switch
+                        checked={row.supports1m}
+                        onCheckedChange={(checked) => {
+                          setClaudeDesktopRoutes((rows) =>
+                            rows.map((item, itemIndex) =>
+                              itemIndex === index
+                                ? { ...item, supports1m: checked }
+                                : item,
+                            ),
+                          );
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Codex 专属字段 */}
+        {appId === "codex" && (
+          <CodexFormFields
+            providerId={providerId}
+            shouldShowApiKey={!usesManagedAuth}
+            codexApiKey={codexApiKey}
+            onApiKeyChange={handleCodexApiKeyChange}
+            category={category}
+            shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
+            websiteUrl={codexWebsiteUrl}
+            isPartner={isCodexPartner}
+            partnerPromotionKey={codexPartnerPromotionKey}
+            apiKeys={apiKeys}
+            onApiKeysChange={handleApiKeysChange}
+            shouldShowSpeedTest={shouldShowSpeedTest}
+            codexBaseUrl={codexBaseUrl}
+            onBaseUrlChange={handleCodexBaseUrlChange}
+            isEndpointModalOpen={isCodexEndpointModalOpen}
+            onEndpointModalToggle={setIsCodexEndpointModalOpen}
+            onCustomEndpointsChange={
+              isEditMode ? undefined : setDraftCustomEndpoints
+            }
+            shouldShowModelField={shouldShowCodexModelField}
+            modelName={codexModelName}
+            onModelNameChange={handleCodexModelNameChange}
+            fetchedModels={codexFetchedModels}
+            isFetchingModels={isFetchingCodexModels}
+            onFetchModels={
+              managedProviderType === "codex_oauth"
+                ? handleFetchCodexManagedModels
+                : undefined
+            }
+            canFetchModels={canFetchCodexManagedModels}
+            fetchModelsHint={
+              canFetchCodexManagedModels
+                ? undefined
+                : t("providerForm.fetchModelsManagedOnly", {
+                    defaultValue:
+                      "只有 Codex OAuth 托管账号支持拉取 live models。",
+                  })
+            }
+            speedTestEndpoints={speedTestEndpoints}
+          />
+        )}
+
+        {/* Gemini 专属字段 */}
+        {appId === "gemini" && (
+          <GeminiFormFields
+            providerId={providerId}
+            shouldShowApiKey={shouldShowApiKeyField}
+            apiKey={geminiApiKey}
+            onApiKeyChange={handleGeminiApiKeyChange}
+            category={category}
+            shouldShowApiKeyLink={shouldShowGeminiApiKeyLink}
+            websiteUrl={geminiWebsiteUrl}
+            isPartner={isGeminiPartner}
+            partnerPromotionKey={geminiPartnerPromotionKey}
+            apiKeys={apiKeys}
+            onApiKeysChange={handleApiKeysChange}
+            shouldShowSpeedTest={shouldShowSpeedTest}
+            baseUrl={geminiBaseUrl}
+            onBaseUrlChange={handleGeminiBaseUrlChange}
+            isEndpointModalOpen={isEndpointModalOpen}
+            onEndpointModalToggle={setIsEndpointModalOpen}
+            onCustomEndpointsChange={setDraftCustomEndpoints}
+            shouldShowModelField={true}
+            model={geminiModel}
+            onModelChange={(model) => {
+              // 同时更新 form.settingsConfig 和 geminiEnv
+              const config = JSON.parse(form.watch("settingsConfig") || "{}");
+              if (!config.env) config.env = {};
+              config.env.GEMINI_MODEL = model;
+              form.setValue("settingsConfig", JSON.stringify(config, null, 2));
+
+              // 同步更新 geminiEnv，确保提交时不丢失
+              const envObj = envStringToObj(geminiEnv);
+              envObj.GEMINI_MODEL = model.trim();
+              const newEnv = envObjToString(envObj);
+              handleGeminiEnvChange(newEnv);
+            }}
+            speedTestEndpoints={speedTestEndpoints}
+          />
+        )}
+
+        {/* OpenCode 专属字段 */}
+        {appId === "opencode" && (
+          <OpenCodeFormFields
+            npm={opencodeState.npm}
+            onNpmChange={opencodeState.handleNpmChange}
+            apiKey={opencodeState.apiKey}
+            onApiKeyChange={opencodeState.handleApiKeyChange}
+            category={category}
+            shouldShowApiKeyLink={shouldShowOpencodeApiKeyLink}
+            websiteUrl={opencodeWebsiteUrl}
+            isPartner={isOpencodePartner}
+            partnerPromotionKey={opencodePartnerPromotionKey}
+            apiKeys={apiKeys}
+            onApiKeysChange={handleApiKeysChange}
+            baseUrl={opencodeState.baseUrl}
+            onBaseUrlChange={opencodeState.handleBaseUrlChange}
+            isFullUrl={opencodeState.isFullUrl}
+            onIsFullUrlChange={opencodeState.handleIsFullUrlChange}
+            modelsUrl={opencodeState.modelsUrl}
+            onModelsUrlChange={opencodeState.handleModelsUrlChange}
+            models={opencodeState.models}
+            onModelsChange={opencodeState.handleModelsChange}
+            extraOptions={opencodeState.extraOptions}
+            onExtraOptionsChange={opencodeState.handleExtraOptionsChange}
+          />
+        )}
+
+        {/* 配置编辑器：Codex、Claude、Gemini 分别使用不同的编辑器 */}
+        {appId === "codex" ? (
+          <>
+            <CodexConfigEditor
+              authValue={codexAuth}
+              configValue={codexConfig}
+              onAuthChange={setCodexAuth}
+              onConfigChange={handleCodexConfigChange}
+              useCommonConfig={useCodexCommonConfigFlag}
+              onCommonConfigToggle={handleCodexCommonConfigToggle}
+              commonConfigSnippet={codexCommonConfigSnippet}
+              onCommonConfigSnippetChange={handleCodexCommonConfigSnippetChange}
+              commonConfigError={codexCommonConfigError}
+              authError={codexAuthError}
+              configError={codexConfigError}
+            />
+            {/* 配置验证错误显示 */}
+            <FormField
+              control={form.control}
+              name="settingsConfig"
+              render={() => (
+                <FormItem className="space-y-0">
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </>
+        ) : appId === "gemini" ? (
+          <>
+            <GeminiConfigEditor
+              envValue={geminiEnv}
+              configValue={geminiConfig}
+              onEnvChange={handleGeminiEnvChange}
+              onConfigChange={handleGeminiConfigChange}
+              useCommonConfig={useGeminiCommonConfigFlag}
+              onCommonConfigToggle={handleGeminiCommonConfigToggle}
+              commonConfigSnippet={geminiCommonConfigSnippet}
+              onCommonConfigSnippetChange={
+                handleGeminiCommonConfigSnippetChange
+              }
+              commonConfigError={geminiCommonConfigError}
+              envError={envError}
+              configError={geminiConfigError}
+            />
+            {/* 配置验证错误显示 */}
+            <FormField
+              control={form.control}
+              name="settingsConfig"
+              render={() => (
+                <FormItem className="space-y-0">
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </>
+        ) : (
+          <>
+            <CommonConfigEditor
+              value={settingsConfigValue}
+              onChange={(value) => form.setValue("settingsConfig", value)}
+              useCommonConfig={useCommonConfig}
+              onCommonConfigToggle={handleCommonConfigToggle}
+              commonConfigSnippet={commonConfigSnippet}
+              onCommonConfigSnippetChange={handleCommonConfigSnippetChange}
+              commonConfigError={commonConfigError}
+              onEditClick={() => setIsCommonConfigModalOpen(true)}
+              isModalOpen={isCommonConfigModalOpen}
+              onModalClose={() => setIsCommonConfigModalOpen(false)}
+              showCommonConfigControls={appId === "claude"}
+              appId={appId}
+            />
+            {/* 配置验证错误显示 */}
+            <FormField
+              control={form.control}
+              name="settingsConfig"
+              render={() => (
+                <FormItem className="space-y-0">
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </>
+        )}
+
+        {showButtons && (
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" type="button" onClick={onCancel}>
+              {t("common.cancel")}
+            </Button>
+            <Button type="submit">{submitLabel}</Button>
+          </div>
+        )}
+      </form>
+      <ConfirmDialog
+        isOpen={softIssues !== null && softIssues.length > 0}
+        variant="info"
+        title={t("providerForm.softValidation.title", {
+          defaultValue: "配置存在以下问题",
+        })}
+        message={`${(softIssues ?? []).map((issue) => `- ${issue}`).join("\n")}\n\n${t(
+          "providerForm.softValidation.hint",
+          {
+            defaultValue:
+              "仍要保存吗？保存后切换此供应商时可能失败，可以之后再补全。",
+          },
+        )}`}
+        confirmText={t("providerForm.softValidation.saveAnyway", {
+          defaultValue: "仍要保存",
+        })}
+        cancelText={t("common.cancel")}
+        onConfirm={async () => {
+          if (isConfirmSubmitting || !pendingFormValues) return;
+          setIsConfirmSubmitting(true);
+          try {
+            await performSubmit(pendingFormValues);
+            setSoftIssues(null);
+            setPendingFormValues(null);
+          } finally {
+            setIsConfirmSubmitting(false);
+          }
+        }}
+        onCancel={() => {
+          if (isConfirmSubmitting) return;
+          setSoftIssues(null);
+          setPendingFormValues(null);
+        }}
+      />
+    </Form>
+  );
+}
+
+export type ProviderFormValues = ProviderFormData & {
+  presetId?: string;
+  presetCategory?: ProviderCategory;
+  isPartner?: boolean;
+  meta?: ProviderMeta;
+  providerKey?: string;
+};

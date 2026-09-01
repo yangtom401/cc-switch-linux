@@ -1,0 +1,15 @@
+target/
+**/target/
+node_modules/
+**/node_modules/
+fyi/
+.env
+data/
+*.db
+*.log
+token.txt
+password.txt
+dist/
+dist-web/
+**/dist/
+**/dist-web/

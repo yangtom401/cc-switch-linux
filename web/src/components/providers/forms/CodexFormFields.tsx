@@ -1,0 +1,190 @@
+import { useTranslation } from "react-i18next";
+import { Download, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import EndpointSpeedTest from "./EndpointSpeedTest";
+import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
+import type { ProviderCategory } from "@/types";
+import type { FetchedModel } from "@/lib/api/model-fetch";
+
+interface EndpointCandidate {
+  url: string;
+}
+
+interface CodexFormFieldsProps {
+  providerId?: string;
+  // API Key
+  shouldShowApiKey?: boolean;
+  codexApiKey: string;
+  onApiKeyChange: (key: string) => void;
+  category?: ProviderCategory;
+  shouldShowApiKeyLink: boolean;
+  websiteUrl: string;
+  isPartner?: boolean;
+  partnerPromotionKey?: string;
+  // 多 KEY 均衡使用：备用 KEY 列表（含主 KEY 在内，首个为当前主 KEY）
+  apiKeys?: string[];
+  onApiKeysChange?: (keys: string[]) => void;
+
+  // Base URL
+  shouldShowSpeedTest: boolean;
+  codexBaseUrl: string;
+  onBaseUrlChange: (url: string) => void;
+  isEndpointModalOpen: boolean;
+  onEndpointModalToggle: (open: boolean) => void;
+  onCustomEndpointsChange?: (endpoints: string[]) => void;
+
+  // Model Name
+  shouldShowModelField?: boolean;
+  modelName?: string;
+  onModelNameChange?: (model: string) => void;
+  fetchedModels?: FetchedModel[];
+  isFetchingModels?: boolean;
+  onFetchModels?: () => void;
+  canFetchModels?: boolean;
+  fetchModelsHint?: string;
+
+  // Speed Test Endpoints
+  speedTestEndpoints: EndpointCandidate[];
+}
+
+export function CodexFormFields({
+  providerId,
+  shouldShowApiKey = true,
+  codexApiKey,
+  onApiKeyChange,
+  category,
+  shouldShowApiKeyLink,
+  websiteUrl,
+  isPartner,
+  partnerPromotionKey,
+  apiKeys,
+  onApiKeysChange,
+  shouldShowSpeedTest,
+  codexBaseUrl,
+  onBaseUrlChange,
+  isEndpointModalOpen,
+  onEndpointModalToggle,
+  onCustomEndpointsChange,
+  shouldShowModelField = true,
+  modelName = "",
+  onModelNameChange,
+  fetchedModels = [],
+  isFetchingModels = false,
+  onFetchModels,
+  canFetchModels = true,
+  fetchModelsHint,
+  speedTestEndpoints,
+}: CodexFormFieldsProps) {
+  const { t } = useTranslation();
+
+  return (
+    <>
+      {/* Codex API Key 输入框 */}
+      {shouldShowApiKey ? (
+        <ApiKeySection
+          id="codexApiKey"
+          label="API Key"
+          value={codexApiKey}
+          onChange={onApiKeyChange}
+          category={category}
+          shouldShowLink={shouldShowApiKeyLink}
+          websiteUrl={websiteUrl}
+          isPartner={isPartner}
+          partnerPromotionKey={partnerPromotionKey}
+          keys={apiKeys}
+          onKeysChange={onApiKeysChange}
+          placeholder={{
+            official: t("providerForm.codexOfficialNoApiKey", {
+              defaultValue: "官方供应商无需 API Key",
+            }),
+            thirdParty: t("providerForm.codexApiKeyAutoFill", {
+              defaultValue: "输入 API Key，将自动填充到配置",
+            }),
+          }}
+        />
+      ) : null}
+
+      {/* Codex Base URL 输入框 */}
+      {shouldShowSpeedTest && (
+        <EndpointField
+          id="codexBaseUrl"
+          label={t("codexConfig.apiUrlLabel")}
+          value={codexBaseUrl}
+          onChange={onBaseUrlChange}
+          placeholder={t("providerForm.codexApiEndpointPlaceholder")}
+          hint={t("providerForm.codexApiHint")}
+          onManageClick={() => onEndpointModalToggle(true)}
+        />
+      )}
+
+      {/* Codex Model Name 输入框 */}
+      {shouldShowModelField && onModelNameChange && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <label
+              htmlFor="codexModelName"
+              className="block text-sm font-medium text-gray-900 dark:text-gray-100"
+            >
+              {t("codexConfig.modelName", { defaultValue: "模型名称" })}
+            </label>
+            {onFetchModels ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={onFetchModels}
+                disabled={isFetchingModels || !canFetchModels}
+                className="h-7 gap-1"
+                title={fetchModelsHint}
+              >
+                {isFetchingModels ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                {t("providerForm.fetchModels")}
+              </Button>
+            ) : null}
+          </div>
+          <div className="flex gap-1">
+            <input
+              id="codexModelName"
+              type="text"
+              value={modelName}
+              onChange={(e) => onModelNameChange(e.target.value)}
+              placeholder={t("codexConfig.modelNamePlaceholder", {
+                defaultValue: "例如: gpt-5-codex",
+              })}
+              className="w-full px-3 py-2 border border-border-default dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20 transition-colors"
+            />
+            {fetchedModels.length > 0 ? (
+              <ModelDropdown
+                models={fetchedModels}
+                onSelect={onModelNameChange}
+              />
+            ) : null}
+          </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            {t("codexConfig.modelNameHint", {
+              defaultValue: "指定使用的模型，将自动更新到 config.toml 中",
+            })}
+          </p>
+        </div>
+      )}
+
+      {/* 端点测速弹窗 - Codex */}
+      {shouldShowSpeedTest && isEndpointModalOpen && (
+        <EndpointSpeedTest
+          appId="codex"
+          providerId={providerId}
+          value={codexBaseUrl}
+          onChange={onBaseUrlChange}
+          initialEndpoints={speedTestEndpoints}
+          visible={isEndpointModalOpen}
+          onClose={() => onEndpointModalToggle(false)}
+          onCustomEndpointsChange={onCustomEndpointsChange}
+        />
+      )}
+    </>
+  );
+}

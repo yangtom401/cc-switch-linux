@@ -1,0 +1,55 @@
+name: Build Linux Binary
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build Web Frontend
+        run: |
+          cd web
+          pnpm install --no-frozen-lockfile
+          pnpm build:web
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web/src-tauri
+
+      - name: Build Backend Server
+        run: |
+          cd web/src-tauri
+          export CC_SWITCH_WEB_ASSETS_DIR="$(pwd)/../dist-web"
+          cargo build --release --example server --features web-server
+          strip target/release/examples/server
+          mkdir -p ../../artifact
+          cp target/release/examples/server ../../artifact/cc-switch-server
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-linux
+          path: artifact/cc-switch-server
+          retention-days: 7

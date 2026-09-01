@@ -1,0 +1,307 @@
+import { Suspense } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import App from "@/App";
+import {
+  WEB_API_BASE_STORAGE_KEY,
+  WEB_AUTH_STORAGE_KEY,
+} from "@/lib/api/adapter";
+import { resetProviderState } from "../msw/state";
+import { emitTauriEvent } from "../msw/tauriMocks";
+
+const toastSuccessMock = vi.fn();
+const toastErrorMock = vi.fn();
+const ACTIVE_APP_STORAGE_KEY = "cc-switch:active-app";
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: (...args: unknown[]) => toastSuccessMock(...args),
+    error: (...args: unknown[]) => toastErrorMock(...args),
+  },
+}));
+
+vi.mock("@/components/providers/ProviderList", () => ({
+  ProviderList: ({
+    providers,
+    currentProviderId,
+    onSwitch,
+    onEdit,
+    onDuplicate,
+    onConfigureUsage,
+    onOpenWebsite,
+    onCreate,
+  }: any) => (
+    <div>
+      <div data-testid="provider-list">{JSON.stringify(providers)}</div>
+      <div data-testid="current-provider">{currentProviderId}</div>
+      <button onClick={() => onSwitch(providers[currentProviderId])}>
+        switch
+      </button>
+      <button onClick={() => onEdit(providers[currentProviderId])}>edit</button>
+      <button onClick={() => onDuplicate(providers[currentProviderId])}>
+        duplicate
+      </button>
+      <button onClick={() => onConfigureUsage(providers[currentProviderId])}>
+        usage
+      </button>
+      <button onClick={() => onOpenWebsite("https://example.com")}>
+        open-website
+      </button>
+      <button onClick={() => onCreate?.()}>create</button>
+    </div>
+  ),
+}));
+
+vi.mock("@/components/providers/ClaudeDesktopPanel", () => ({
+  ClaudeDesktopPanel: () => <div data-testid="claude-desktop-panel" />,
+}));
+
+vi.mock("@/components/providers/AddProviderDialog", () => ({
+  AddProviderDialog: ({ open, onOpenChange, onSubmit, appId }: any) =>
+    open ? (
+      <div data-testid="add-provider-dialog">
+        <button
+          onClick={() =>
+            onSubmit({
+              name: `New ${appId} Provider`,
+              settingsConfig: {},
+              category: "custom",
+              sortIndex: 99,
+            })
+          }
+        >
+          confirm-add
+        </button>
+        <button onClick={() => onOpenChange(false)}>close-add</button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/providers/EditProviderDialog", () => ({
+  EditProviderDialog: ({ open, provider, onSubmit, onOpenChange }: any) =>
+    open ? (
+      <div data-testid="edit-provider-dialog">
+        <button
+          onClick={() =>
+            onSubmit({
+              ...provider,
+              name: `${provider.name}-edited`,
+            })
+          }
+        >
+          confirm-edit
+        </button>
+        <button onClick={() => onOpenChange(false)}>close-edit</button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/UsageScriptModal", () => ({
+  default: ({ isOpen, provider, onSave, onClose }: any) =>
+    isOpen ? (
+      <div data-testid="usage-modal">
+        <span data-testid="usage-provider">{provider?.id}</span>
+        <button onClick={() => onSave("script-code")}>save-script</button>
+        <button onClick={() => onClose()}>close-usage</button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/ConfirmDialog", () => ({
+  ConfirmDialog: ({ isOpen, onConfirm, onCancel }: any) =>
+    isOpen ? (
+      <div data-testid="confirm-dialog">
+        <button onClick={() => onConfirm()}>confirm-delete</button>
+        <button onClick={() => onCancel()}>cancel-delete</button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/settings/SettingsDialog", () => ({
+  SettingsDialog: ({ open, onOpenChange, onImportSuccess }: any) =>
+    open ? (
+      <div data-testid="settings-dialog">
+        <button onClick={() => onImportSuccess?.()}>
+          trigger-import-success
+        </button>
+        <button onClick={() => onOpenChange(false)}>close-settings</button>
+      </div>
+    ) : (
+      <button onClick={() => onOpenChange(true)}>open-settings</button>
+    ),
+}));
+
+vi.mock("@/components/AppSwitcher", () => ({
+  AppSwitcher: ({ activeApp, onSwitch }: any) => (
+    <div data-testid="app-switcher">
+      <span>{activeApp}</span>
+      <button onClick={() => onSwitch("claude")}>switch-claude</button>
+      <button onClick={() => onSwitch("claude-desktop")}>
+        switch-claude-desktop
+      </button>
+      <button onClick={() => onSwitch("codex")}>switch-codex</button>
+    </div>
+  ),
+}));
+
+vi.mock("@/components/UpdateBadge", () => ({
+  UpdateBadge: ({ onClick }: any) => (
+    <button onClick={onClick}>update-badge</button>
+  ),
+}));
+
+vi.mock("@/components/mcp/McpPanel", () => ({
+  default: ({ open, onOpenChange }: any) =>
+    open ? (
+      <div data-testid="mcp-panel">
+        <button onClick={() => onOpenChange(false)}>close-mcp</button>
+      </div>
+    ) : (
+      <button onClick={() => onOpenChange(true)}>open-mcp</button>
+    ),
+}));
+
+const renderApp = () => {
+  const client = new QueryClient();
+  return render(
+    <QueryClientProvider client={client}>
+      <Suspense fallback={<div data-testid="loading">loading</div>}>
+        <App />
+      </Suspense>
+    </QueryClientProvider>,
+  );
+};
+
+describe("App integration with MSW", () => {
+  beforeEach(() => {
+    (window as any).__TAURI__ = {};
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    resetProviderState();
+    toastSuccessMock.mockReset();
+    toastErrorMock.mockReset();
+    window.localStorage.removeItem(ACTIVE_APP_STORAGE_KEY);
+  });
+
+  it("covers basic provider flows via real hooks", async () => {
+    renderApp();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "claude-1",
+      ),
+    );
+
+    fireEvent.click(screen.getByText("update-badge"));
+    expect(await screen.findByTestId("settings-dialog")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("trigger-import-success"));
+    fireEvent.click(screen.getByText("close-settings"));
+
+    fireEvent.click(screen.getByText("create"));
+    expect(
+      await screen.findByTestId("add-provider-dialog"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("confirm-add"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toMatch(
+        /New claude Provider/,
+      ),
+    );
+
+    fireEvent.click(screen.getByText("edit"));
+    expect(
+      await screen.findByTestId("edit-provider-dialog"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("confirm-edit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toMatch(
+        /-edited/,
+      ),
+    );
+
+    fireEvent.click(screen.getByText("switch"));
+    fireEvent.click(screen.getByText("duplicate"));
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toMatch(/copy/),
+    );
+
+    fireEvent.click(screen.getByText("open-website"));
+
+    emitTauriEvent("provider-switched", {
+      appType: "claude",
+      providerId: "claude-2",
+    });
+
+    expect(toastErrorMock).not.toHaveBeenCalled();
+    expect(toastSuccessMock).toHaveBeenCalled();
+  });
+
+  it("opens the unified gateway info dialog", async () => {
+    renderApp();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "claude-1",
+      ),
+    );
+
+    fireEvent.click(screen.getByText("网关接口"));
+    expect(await screen.findByText("统一 AI 网关接口")).toBeInTheDocument();
+  });
+
+  it("validates web credentials via buildWebApiUrl", async () => {
+    const originalTauri = (window as any).__TAURI__;
+    delete (window as any).__TAURI__;
+    const originalApiBase = window.localStorage.getItem(
+      WEB_API_BASE_STORAGE_KEY,
+    );
+    window.localStorage.removeItem(WEB_API_BASE_STORAGE_KEY);
+    window.sessionStorage.setItem(WEB_AUTH_STORAGE_KEY, "encoded");
+
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (input) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+
+        if (url.includes("/api/settings")) {
+          return new Response(null, { status: 401 }) as Response;
+        }
+        if (url.includes("/api/providers/codex/current")) {
+          return Response.json(null) as Response;
+        }
+        if (url.includes("/api/providers/codex")) {
+          return Response.json({}) as Response;
+        }
+
+        return Response.json({}) as Response;
+      });
+
+    try {
+      renderApp();
+
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/api/settings",
+          expect.objectContaining({
+            method: "GET",
+            credentials: "include",
+          }),
+        ),
+      );
+    } finally {
+      fetchMock.mockRestore();
+      window.sessionStorage.removeItem(WEB_AUTH_STORAGE_KEY);
+      if (originalApiBase) {
+        window.localStorage.setItem(WEB_API_BASE_STORAGE_KEY, originalApiBase);
+      } else {
+        window.localStorage.removeItem(WEB_API_BASE_STORAGE_KEY);
+      }
+      (window as any).__TAURI__ = originalTauri;
+    }
+  });
+});
