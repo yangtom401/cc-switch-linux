@@ -535,8 +535,7 @@ pub fn create_router_with_auth_state(state: SharedState, auth_state: SharedWebAu
     let mut router = routes::create_router(state.clone())
         .fallback(api_not_found)
         .layer(Extension(csrf_token))
-        .layer(Extension(auth_state))
-        .layer(ValidateRequestHeaderLayer::custom(auth_validator.clone()));
+        .layer(Extension(auth_state));
 
     if body_limit > 0 {
         router = router.layer(DefaultBodyLimit::max(body_limit));
@@ -565,8 +564,7 @@ pub fn create_router_with_auth_state(state: SharedState, auth_state: SharedWebAu
                 let api_base = api_prefix_arc.clone();
                 move |path, headers| serve_static(path, headers, tokens.clone(), api_base.clone())
             }),
-        )
-        .layer(ValidateRequestHeaderLayer::custom(auth_validator));
+        );
 
     let proxy_router = crate::proxy::create_proxy_router(state.clone());
 
